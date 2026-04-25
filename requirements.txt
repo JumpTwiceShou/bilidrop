@@ -1,0 +1,5 @@
+httpx
+colorama
+PySide6
+apprise
+selenium
