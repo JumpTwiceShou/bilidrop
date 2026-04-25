@@ -16,6 +16,7 @@ from PySide6.QtGui import QCloseEvent, QFont, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -93,6 +94,8 @@ _CARD_STYLE = (
     "QFrame#card{background:#242832;border:1px solid #2f3440;border-radius:10px;}"
 )
 
+_COOKIE_STORE_NAME = "cookies.json"
+
 
 class MinerGUI(QMainWindow):
     # Cross-thread UI dispatcher. Any background thread may emit this signal;
@@ -125,11 +128,14 @@ class MinerGUI(QMainWindow):
         self._stop_timeout_warned: bool = False
         self._stop_force_sent: bool = False
         self._auto_force_stop_after_seconds: float = 2.0
+        self._cookie_profiles: list[dict[str, str]] = []
+        self._cookie_profile_loading = False
 
         self.ui_call.connect(self._on_ui_call, Qt.QueuedConnection)
 
         self._build_layout()
         self._install_logging()
+        self._load_cookie_profiles()
 
         self._log_timer = QTimer(self)
         self._log_timer.setInterval(120)
@@ -203,11 +209,37 @@ class MinerGUI(QMainWindow):
         config_layout.addLayout(self._build_labeled_row("通知 URL", self.notify_urls_edit))
 
         # small numeric row
-        self.threads_edit = self._make_small_edit("1")
+        self.threads_edit = self._make_small_edit("128")
         self.reconnect_edit = self._make_small_edit("8")
         self.task_interval_edit = self._make_small_edit("30")
         self.verbose_check = QCheckBox("详细日志")
         self.disable_task_notify_check = QCheckBox("禁用任务完成通知")
+
+        self.cookie_profile_combo = QComboBox()
+        self.cookie_profile_combo.setMinimumWidth(240)
+        self.cookie_profile_combo.currentIndexChanged.connect(
+            self._on_cookie_profile_selected
+        )
+        self.cookie_remark_edit = self._make_line_edit("自定义备注，例如账号A/主号/小号")
+
+        cookie_profile_row = QHBoxLayout()
+        cookie_profile_row.setSpacing(8)
+        cookie_profile_label = QLabel("Cookie档案")
+        cookie_profile_label.setFixedWidth(72)
+        cookie_profile_label.setStyleSheet("color:#9aa0a6;")
+        cookie_profile_row.addWidget(cookie_profile_label)
+        cookie_profile_row.addWidget(self.cookie_profile_combo, 1)
+        cookie_remark_label = QLabel("备注")
+        cookie_remark_label.setStyleSheet("color:#9aa0a6;")
+        cookie_profile_row.addWidget(cookie_remark_label)
+        cookie_profile_row.addWidget(self.cookie_remark_edit, 1)
+        cookie_profile_row.addWidget(
+            self._make_button("保存Cookie", "blue", self.save_cookie_profile)
+        )
+        cookie_profile_row.addWidget(
+            self._make_button("删除Cookie", "gray", self.delete_cookie_profile)
+        )
+        config_layout.addLayout(cookie_profile_row)
 
         num_row = QHBoxLayout()
         num_row.setSpacing(12)
@@ -412,13 +444,157 @@ class MinerGUI(QMainWindow):
     def _show_error(self, title: str, msg: str) -> None:
         QMessageBox.critical(self, title, msg)
 
+    # ---------- cookie profiles ----------
+
+    def _cookie_store_path(self) -> Path:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().with_name(_COOKIE_STORE_NAME)
+        return Path.cwd() / _COOKIE_STORE_NAME
+
+    @staticmethod
+    def _cookie_default_remark(cookie: str) -> str:
+        match = re.search(r"(?:^|;\s*)DedeUserID=([^;]+)", cookie)
+        if match:
+            return f"UID {match.group(1)}"
+        return time.strftime("Cookie %Y-%m-%d %H:%M:%S")
+
+    def _load_cookie_profiles(self) -> None:
+        path = self._cookie_store_path()
+        profiles: list[dict[str, str]] = []
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                raw_profiles = (
+                    data.get("cookies", data) if isinstance(data, dict) else data
+                )
+                if isinstance(raw_profiles, list):
+                    for raw in raw_profiles:
+                        if not isinstance(raw, dict):
+                            continue
+                        cookie = str(raw.get("cookie", "")).strip()
+                        if not cookie:
+                            continue
+                        remark = str(raw.get("remark", "")).strip()
+                        if not remark:
+                            remark = self._cookie_default_remark(cookie)
+                        updated_at = str(raw.get("updated_at", "")).strip()
+                        profiles.append(
+                            {
+                                "remark": remark,
+                                "cookie": cookie,
+                                "updated_at": updated_at,
+                            }
+                        )
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Cookie档案加载失败: %s", exc)
+        self._cookie_profiles = profiles
+        self._refresh_cookie_profile_combo()
+
+    def _write_cookie_profiles(self) -> None:
+        path = self._cookie_store_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {"cookies": self._cookie_profiles}
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _refresh_cookie_profile_combo(self, selected_cookie: str | None = None) -> None:
+        if selected_cookie is None:
+            selected_cookie = self.cookie_edit.text().strip()
+        self._cookie_profile_loading = True
+        try:
+            self.cookie_profile_combo.clear()
+            self.cookie_profile_combo.addItem("未选择", "")
+            selected_index = 0
+            for idx, profile in enumerate(self._cookie_profiles, start=1):
+                remark = profile.get("remark", "").strip() or f"Cookie {idx}"
+                updated_at = profile.get("updated_at", "").strip()
+                label = f"{remark} ({updated_at})" if updated_at else remark
+                cookie = profile.get("cookie", "")
+                self.cookie_profile_combo.addItem(label, cookie)
+                if selected_cookie and cookie == selected_cookie:
+                    selected_index = idx
+            self.cookie_profile_combo.setCurrentIndex(selected_index)
+        finally:
+            self._cookie_profile_loading = False
+
+    def _selected_cookie_profile_index(self) -> int | None:
+        index = self.cookie_profile_combo.currentIndex() - 1
+        if 0 <= index < len(self._cookie_profiles):
+            return index
+        return None
+
+    def _on_cookie_profile_selected(self, index: int) -> None:
+        if self._cookie_profile_loading or index <= 0:
+            return
+        profile_index = index - 1
+        if not (0 <= profile_index < len(self._cookie_profiles)):
+            return
+        profile = self._cookie_profiles[profile_index]
+        cookie = profile.get("cookie", "").strip()
+        if not cookie:
+            return
+        self.cookie_edit.setText(cookie)
+        self.cookie_remark_edit.setText(profile.get("remark", ""))
+        if self.miner is not None:
+            self.miner.update_cookie(cookie)
+        logging.getLogger(__name__).info("已切换Cookie: %s", profile.get("remark", ""))
+
+    def save_cookie_profile(self) -> None:
+        cookie = self.cookie_edit.text().strip()
+        if not cookie:
+            self._show_warning("提示", "请先填写 Cookie")
+            return
+        remark = self.cookie_remark_edit.text().strip()
+        if not remark:
+            remark = self._cookie_default_remark(cookie)
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        profile = {"remark": remark, "cookie": cookie, "updated_at": now}
+
+        target_index = self._selected_cookie_profile_index()
+        if target_index is None:
+            for idx, item in enumerate(self._cookie_profiles):
+                if item.get("cookie") == cookie or item.get("remark") == remark:
+                    target_index = idx
+                    break
+
+        if target_index is None:
+            self._cookie_profiles.append(profile)
+        else:
+            self._cookie_profiles[target_index] = profile
+
+        try:
+            self._write_cookie_profiles()
+            self._refresh_cookie_profile_combo(selected_cookie=cookie)
+            self.cookie_remark_edit.setText(remark)
+            logging.getLogger(__name__).info(
+                "Cookie已保存到 %s", self._cookie_store_path()
+            )
+        except Exception as exc:
+            self._show_error("保存Cookie失败", str(exc))
+
+    def delete_cookie_profile(self) -> None:
+        target_index = self._selected_cookie_profile_index()
+        if target_index is None:
+            self._show_warning("提示", "请先选择要删除的 Cookie 档案")
+            return
+        profile = self._cookie_profiles.pop(target_index)
+        try:
+            self._write_cookie_profiles()
+            self._refresh_cookie_profile_combo()
+            self.cookie_remark_edit.clear()
+            logging.getLogger(__name__).info(
+                "已删除Cookie: %s", profile.get("remark", "")
+            )
+        except Exception as exc:
+            self._cookie_profiles.insert(target_index, profile)
+            self._show_error("删除Cookie失败", str(exc))
+
     # ---------- config ----------
 
     def _build_config(self) -> MinerConfig:
         return MinerConfig(
             cookie=self.cookie_edit.text().strip(),
             room_ids=parse_room_ids(self.rooms_edit.text().strip()),
-            thread_count=int(self.threads_edit.text().strip() or "1"),
+            thread_count=int(self.threads_edit.text().strip() or "128"),
             reconnect_delay_seconds=int(self.reconnect_edit.text().strip() or "8"),
             enable_web_heartbeat=True,
             task_ids=parse_task_ids(self.task_ids_edit.text().strip()),
@@ -663,6 +839,7 @@ class MinerGUI(QMainWindow):
 
     def _apply_auto_cookie(self, cookie_str: str) -> None:
         self.cookie_edit.setText(cookie_str)
+        self.cookie_remark_edit.setText(self._cookie_default_remark(cookie_str))
 
     def _apply_auto_task_ids(self, task_ids_str: str) -> None:
         self.task_ids_edit.setText(task_ids_str)
@@ -1351,7 +1528,7 @@ class MinerGUI(QMainWindow):
             data = json.loads(Path(path).read_text(encoding="utf-8"))
             self.cookie_edit.setText(str(data.get("cookie", "")))
             self.rooms_edit.setText(",".join(str(x) for x in data.get("room_ids", [])))
-            self.threads_edit.setText(str(data.get("thread_count", 1)))
+            self.threads_edit.setText(str(data.get("thread_count", 128)))
             self.reconnect_edit.setText(str(data.get("reconnect_delay_seconds", 8)))
             self.task_ids_edit.setText(",".join(str(x) for x in data.get("task_ids", [])))
             self.task_interval_edit.setText(
@@ -1421,6 +1598,21 @@ def run_gui() -> int:
         }
         QLineEdit:focus { border-color: #4f8cff; }
         QLineEdit:disabled { color: #6b7280; background: #23262e; }
+
+        QComboBox {
+            background: #2b2f3a; color: #e6e7eb;
+            border: 1px solid #2f3440; border-radius: 6px;
+            padding: 6px 10px; min-height: 20px;
+            selection-background-color: #4f8cff;
+        }
+        QComboBox:focus { border-color: #4f8cff; }
+        QComboBox::drop-down {
+            border: 0; width: 24px; background: transparent;
+        }
+        QComboBox QAbstractItemView {
+            background: #242832; color: #e6e7eb;
+            border: 1px solid #2f3440; selection-background-color: #4f8cff;
+        }
 
         QPlainTextEdit {
             background: #1f222a; color: #d8dae0;

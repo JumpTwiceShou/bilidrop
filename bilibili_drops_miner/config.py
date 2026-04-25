@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 class MinerConfig:
     cookie: str
     room_ids: list[int]
-    thread_count: int = 1
+    thread_count: int = 128
     reconnect_delay_seconds: int = 8
     enable_web_heartbeat: bool = True
     task_ids: list[str] = field(default_factory=list)
