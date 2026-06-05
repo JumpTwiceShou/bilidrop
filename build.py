@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--release",
         action="store_true",
-        help="build release version (onefile). Default is development build (onedir).",
+        help="build release version (onedir). Default is development build (onedir).",
     )
     parser.add_argument(
         "--clean",
@@ -102,12 +102,31 @@ def main() -> None:
 
     is_release = args.release
 
-    # apprise 通过文件系统扫描动态加载 plugins/ 下的通知后端，
-    # PyInstaller 静态分析不到，必须 --collect-all 把 plugins 目录一并打包
-    common_extra_args = [
-        "--collect-all",
-        "apprise",
+    # 发布包使用 notifier.py 里的轻量内置通知，避免把 Apprise 的全量插件
+    # 都塞进包里。源码环境仍可通过 Apprise 回退支持更多通知渠道。
+    unused_optional_excludes = [
+        "--exclude-module",
+        "IPython",
+        "--exclude-module",
+        "jedi",
+        "--exclude-module",
+        "jinja2",
+        "--exclude-module",
+        "matplotlib",
+        "--exclude-module",
+        "numpy",
+        "--exclude-module",
+        "PIL",
+        "--exclude-module",
+        "prompt_toolkit",
+        "--exclude-module",
+        "pygments",
+        "--exclude-module",
+        "tkinter",
+        "--exclude-module",
+        "traitlets",
     ]
+    common_extra_args = unused_optional_excludes + ["--exclude-module", "apprise"]
 
     gui_extra_args = common_extra_args + [
         "--collect-all",
@@ -119,7 +138,7 @@ def main() -> None:
             "bilibili_gui.py",
             "bilibili-drops-miner-gui",
             windowed=True,
-            onefile=is_release,
+            onefile=False,
             clean=args.clean,
             noupx=True,
             debug=args.debug,
@@ -130,7 +149,7 @@ def main() -> None:
         build(
             "bilibili.py",
             "bilibili-drops-miner-cli",
-            onefile=is_release,
+            onefile=False,
             clean=False,  # 避免第二个目标再次清缓存
             noupx=True,
             debug=args.debug,

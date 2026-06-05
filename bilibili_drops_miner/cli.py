@@ -31,7 +31,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--notify-urls",
         default="",
-        help="Apprise URLs, comma/newline separated (WeCom, Gotify, ServerChan, etc.)",
+        help="Notification URLs, comma/newline separated (WeCom, Gotify, ServerChan, etc.)",
     )
     parser.add_argument(
         "--disable-task-notify",

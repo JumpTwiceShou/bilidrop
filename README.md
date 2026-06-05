@@ -1,186 +1,199 @@
-# Bilibili 直播掉宝助手
+# Bilibili 直播掉宝助手增强版
 
-轻量、直接的 B 站直播掉宝/观看时长任务挂机工具。  
-支持 GUI 与 CLI 双模式，支持多房间、多会话并行与任务进度追踪。
+这是一个基于 [mi0e/BiliBiliDropsMiner](https://github.com/mi0e/BiliBiliDropsMiner) 的 B 站直播掉宝/观看时长任务挂机工具。
+本版本同步了上游最近版本的主要功能，并额外加入 GUI Cookie 档案管理，默认线程数调整为 128。
 
-- [Release 下载](https://github.com/mi0e/BiliBiliDropsMiner/releases/latest)
-- [国内下载（密码 1234）](https://wwaqd.lanzoum.com/b019vsjd5i)
+## 许可与来源
 
-![GUI 截图](img/image_5.png)
+- 原项目：<https://github.com/mi0e/BiliBiliDropsMiner>
+- 原项目说明：B 站直播掉宝助手，支持多线程加速
+- 本项目遵守 MIT License，已在 [LICENSE](LICENSE) 中保留原项目与本项目的版权声明。
+- 本项目仅供个人学习研究使用，不提供稳定性保证或技术支持。
 
-## 🛠️ 功能
+## 本版本增强
 
-- 多房间并发挂机，支持每房间多会话连接
-- 任务进度自动轮询 + 手动刷新
-- 支持 Apprise 多平台通知（企业微信、Gotify、Server 酱等）
-- GUI 支持配置保存/加载、日志查看、自动获取 Cookie 与任务 ID
+- GUI 支持将 Cookie 保存到 `cookies.json`。
+- GUI 支持在下拉框中切换多个 Cookie。
+- 每个 Cookie 档案支持自定义备注，未填写备注时会优先使用 `DedeUserID` 自动生成。
+- 默认线程数从 1 调整为 128，包括 GUI、CLI、配置默认值和示例配置。
+- 版本检查目标改为本仓库 release。
 
-## ⚠️ 免责声明
+`cookies.json` 保存位置：
 
-> [!IMPORTANT]
-> **Disclaimer / 免责声明**
-> - 本项目仅供个人学习研究，不保证稳定性，不提供技术支持
-> - 使用本项目产生的一切后果由用户自行承担
-> - 禁止商业用途，请遵守版权及平台规定
-> - This project is for **personal learning and research purposes only**
-> - No stability guarantee or technical support provided
-> - Users are solely responsible for any consequences of using this project
-> - Commercial use is strictly prohibited
-> - Please respect copyright and platform ToS
+- 源码运行：当前工作目录。
+- 打包 exe 运行：exe 同目录。
 
-## 🔍 参数获取指南
+示例格式：
 
-> [!WARNING]
-> 所有自动获取功能仅支持 Edge/Chrome！！！
-> 
-> 所有自动获取功能仅支持 Edge/Chrome！！！
-> 
-> 所有自动获取功能仅支持 Edge/Chrome！！！
+```json
+{
+  "cookies": [
+    {
+      "remark": "主号",
+      "cookie": "SESSDATA=xxx; bili_jct=xxx; DedeUserID=123",
+      "updated_at": "2026-06-05 23:00:00"
+    }
+  ]
+}
+```
 
-### Cookie（必填）
+## 已同步的上游更新
 
-方式 1（推荐）：GUI 中点击“自动获取”，在弹出的浏览器中登录 B 站。  
-方式 2（手动）：登录 B 站后 F12 打开开发者工具复制 Cookie，必需包含 `SESSDATA` 和 `bili_jct`，具体方法自行查询。
+对比上游最近几个版本，本版本已同步到上游 `main`，包含以下能力：
 
-### 房间号（必填）
+- `v1.4.3`：改进任务 ID 提取逻辑，支持 Nuitka 打包。
+- `v1.5.0`：新增一键领取全部掉宝奖励，改进 Chrome/Edge 跨平台检测，修复按日期分组的掉宝任务识别。
+- `v1.5.1`：修复自动获取浏览器优先级和任务进度误判。
+- `v1.5.2`：修复多标签检测，加入新版本检查。
+- `main` 后续更新：GUI 模块化、FAQ 补充、Chrome 新页面注入修复。
 
-方式 1（推荐）：点击自动获取任务 ID 后进入直播间，房间号会自动回填。  
-方式 2（手动）：直播间 URL 中的数字部分即为房间号，例如 `https://live.bilibili.com/23612045` 中房间号为 `23612045`。
+## 功能
 
+- 多房间并发挂机，支持每个房间多会话连接。
+- GUI 与 CLI 双模式。
+- 任务进度自动轮询与手动刷新。
+- 直播观看时长预估展示。
+- 一键领取掉宝奖励。
+- 自动获取 Cookie、房间号、任务 ID。
+- GUI 配置保存/加载。
+- Cookie 档案保存、备注和切换。
+- Gotify、Server 酱等通知地址支持。
 
-### 任务 ID（可选）
+## 免责声明
 
-方式 1（推荐）：GUI 中点击“自动获取”，进入活动直播间后自动回填。  
-方式 2（手动）：在任务接口请求中提取 task_ids 参数。
+> 本项目仅供个人学习研究，不保证稳定性，不提供技术支持。
+> 使用本项目产生的一切后果由用户自行承担。
+> 禁止商业用途，请遵守版权及平台规则。
 
-典型请求示例：
+## 参数获取
+
+### Cookie
+
+方式 1：GUI 中点击“自动获取”，在打开的 Chrome/Edge 浏览器中登录 B 站。
+方式 2：登录 B 站后打开浏览器开发者工具复制 Cookie。
+
+Cookie 必须至少包含：
+
+- `SESSDATA`
+- `bili_jct`
+
+建议同时保留：
+
+- `DedeUserID`
+- `DedeUserID__ckMd5`
+- `buvid3`
+
+### 房间号
+
+直播间 URL 中的数字部分就是房间号。
+例如 `https://live.bilibili.com/23612045` 的房间号为 `23612045`。
+
+### 任务 ID
+
+可在 GUI 中点击“自动获取任务 ID”。
+也可以从任务接口请求里提取 `task_ids` 参数：
 
 ```text
 https://api.bilibili.com/x/task/totalv2?csrf=xxx&task_ids=taskId1,taskId2
 ```
+多个任务 ID 使用英文逗号分隔。
 
-格式为逗号分隔的字符串，例如 `taskId1,taskId2`。
+## 快速开始
 
-### 通知推送（可选）
+### Windows GUI
 
-项目基于 [Apprise](https://github.com/caronc/apprise)，支持 80+ 通知渠道。
-
-常见格式：
-
-- 企业微信: `wxwork://corpid/agentid/secret/?to=@all`
-- Gotify: `gotify://host/token`
-- Server 酱: `schan://SendKey`
-
-多个通知地址可用逗号分隔。
-
-## 🚀 快速开始
-
-### Windows
-
-1. 安装 Python 3.10+
-2. 克隆项目并安装依赖
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. 启动 GUI
-   ```bash
-   python bilibili_gui.py
-   ```
-
-### Linux / macOS
-
-1. 安装 Python 3.10+
-2. 安装依赖
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. 启动 CLI
-   ```bash
-   python bilibili.py --cookie "SESSDATA=xxx; bili_jct=xxx" --rooms "23612045"
-   ```
-
-## 📜 使用文档
-
-### GUI（推荐）
-
-```bash
+```powershell
+python -m pip install -r requirements.txt
 python bilibili_gui.py
 ```
 
-填入 Cookie、房间号、任务 ID 后点击“启动”。
-
-你也可以在 GUI 中直接使用：
-
-- Cookie 自动获取（浏览器登录后自动回填）
-- 任务 ID 自动获取（抓取任务接口并自动回填）
-- 配置文件保存/加载（JSON）
+也可以直接运行 release 中的 exe。
 
 ### CLI
 
-- 获取命令帮助：`python bilibili.py --help`
+```powershell
+python bilibili.py --cookie "SESSDATA=xxx; bili_jct=xxx" --rooms "23612045"
+```
 
-```shell
-Bilibili Watch-Time Miner
+常用参数：
 
-Usage: python bilibili.py [OPTIONS]
-
-Options:
-   --cookie COOKIE                        		B站登录 Cookie
-   --rooms ROOMS                          		房间号，逗号分隔
-   --threads THREADS                      		每房间会话数（可加速任务进度）
-   --reconnect-delay RECONNECT_DELAY      		断线重连延迟（秒）
-   --disable-web-heartbeat                		关闭 x25Kn 业务心跳
-   --task-ids TASK_IDS                    		用于进度监控的任务 ID
-   --task-interval TASK_INTERVAL          		任务查询间隔（秒）
-   --notify-urls NOTIFY_URLS              		Apprise 通知 URL，逗号分隔
-   --disable-task-notify                  		关闭任务完成通知
-   --no-color                             		禁用彩色日志输出
-   -v, --verbose                          		显示详细调试日志	
-   -h, --help                             		显示此帮助信息并退出
+```text
+--cookie COOKIE                 B 站登录 Cookie
+--rooms ROOMS                   房间号，多个用逗号分隔
+--threads THREADS               每个房间会话数，默认 128
+--reconnect-delay SECONDS       断线重连延迟
+--task-ids TASK_IDS             用于进度监控的任务 ID
+--task-interval SECONDS         任务查询间隔
+--notify-urls URLS              通知 URL，多个用逗号分隔
+--disable-task-notify           关闭任务完成通知
+--no-color                      禁用彩色日志
+-v, --verbose                   显示详细日志
 ```
 
 示例：
 
-```bash
-python bilibili.py \
-   --cookie "SESSDATA=xxx; bili_jct=xxx" \
-   --rooms "23612045,1017" \
-   --threads 2 \
-   --task-ids "taskId1,taskId2" \
-   --notify-urls "gotify://host/token" \
-   -v
+```powershell
+python bilibili.py `
+  --cookie "SESSDATA=xxx; bili_jct=xxx" `
+  --rooms "23612045,1017" `
+  --threads 128 `
+  --task-ids "taskId1,taskId2"
 ```
 
-## 📦 打包 EXE
+## GUI 使用
 
-```bash
-python build.py               # 开发模式（onedir）
-python build.py --release     # 发布模式（onefile）
-python build.py --target gui  # 仅打包 GUI
-python build.py --target cli  # 仅打包 CLI
+1. 填写或自动获取 Cookie。
+2. 填写直播间号。
+3. 可选：填写或自动获取任务 ID。
+4. 可选：填写通知 URL。
+5. 按需调整线程数、重连延迟和任务查询间隔。
+6. 点击“启动”。
+
+Cookie 档案：
+
+1. 在 Cookie 输入框填入 Cookie。
+2. 在“备注”中填写账号备注。
+3. 点击“保存Cookie”写入 `cookies.json`。
+4. 之后可从“Cookie档案”下拉框切换账号。
+5. 选择档案后点击“删除Cookie”可删除该档案。
+
+## 配置文件
+
+GUI 支持保存/加载 JSON 配置文件，示例见 [config.example.json](config.example.json)。
+
+## 打包
+
+PyInstaller：
+
+```powershell
+python build.py --target gui --clean
+python build.py --target cli --clean
 ```
 
-## 🧩 配置文件
+Nuitka：
 
-GUI 支持保存/加载 JSON 配置文件，格式可参考 config.example.json。
-
-## 🧑‍💻 开发
-
-安装开发依赖：
-
-```bash
-pip install -r requirements.txt
+```powershell
+python -m pip install nuitka
+python build_nuitka.py --target gui
 ```
 
-本地调试：
+## 常见问题
 
-- GUI: `python bilibili_gui.py`
-- CLI: `python bilibili.py --help`
+### 任务时长为什么一直为 0？
 
-## ⭐ Stars
+任务时长通常不是实时结算。启动后至少等待 30 秒再观察。若长时间为 0，可能是账号风控或直播任务未被平台认可。
 
-如果这个项目对你有帮助，欢迎点一个 Star。
+### 线程数越高越好吗？
 
-## 📄 License
+不是。线程数过高可能触发平台风控。当前默认值是 128，适合追求高并发的场景；如果出现异常，建议降低到 60 到 80 后重试。
 
-MIT
+### 自动获取打不开浏览器怎么办？
+
+自动获取依赖 Chrome/Edge 和 Selenium。请确认浏览器安装在常见路径，首次运行时 Selenium Manager 可能会下载驱动。
+
+## 开发验证
+
+```powershell
+python -m compileall bilibili_drops_miner bilibili.py bilibili_gui.py build.py build_nuitka.py
+python bilibili.py --help
+```
