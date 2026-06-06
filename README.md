@@ -166,9 +166,11 @@ GUI 支持保存/加载 JSON 配置文件，示例见 [config.example.json](conf
 PyInstaller：
 
 ```powershell
-python build.py --target gui --clean
+python build.py --release --target gui --clean
 python build.py --target cli --clean
 ```
+
+`--release` 会输出单个可直接运行的 exe；默认不带 `--release` 时输出开发用文件夹。
 
 Nuitka：
 

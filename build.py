@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--release",
         action="store_true",
-        help="build release version (onedir). Default is development build (onedir).",
+        help="build release version as a single exe. Default is development build (onedir).",
     )
     parser.add_argument(
         "--clean",
@@ -129,7 +129,9 @@ def main() -> None:
     common_extra_args = unused_optional_excludes + ["--exclude-module", "apprise"]
 
     gui_extra_args = common_extra_args + [
-        "--collect-all",
+        "--collect-submodules",
+        "selenium",
+        "--collect-binaries",
         "selenium",
     ]
 
@@ -138,7 +140,7 @@ def main() -> None:
             "bilibili_gui.py",
             "bilibili-drops-miner-gui",
             windowed=True,
-            onefile=False,
+            onefile=is_release,
             clean=args.clean,
             noupx=True,
             debug=args.debug,
@@ -149,7 +151,7 @@ def main() -> None:
         build(
             "bilibili.py",
             "bilibili-drops-miner-cli",
-            onefile=False,
+            onefile=is_release,
             clean=False,  # 避免第二个目标再次清缓存
             noupx=True,
             debug=args.debug,

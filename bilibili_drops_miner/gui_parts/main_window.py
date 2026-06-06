@@ -258,7 +258,11 @@ class MinerGUI(QMainWindow):
     def _write_cookie_profiles(self) -> None:
         save_cookie_profiles(self._cookie_profiles)
 
-    def _refresh_cookie_profile_combo(self, selected_cookie: str | None = None) -> None:
+    def _refresh_cookie_profile_combo(
+        self,
+        selected_cookie: str | None = None,
+        selected_profile_index: int | None = None,
+    ) -> None:
         if selected_cookie is None:
             selected_cookie = self.cookie_edit.text().strip()
         self._cookie_profile_loading = True
@@ -266,13 +270,24 @@ class MinerGUI(QMainWindow):
             self.cookie_profile_combo.clear()
             self.cookie_profile_combo.addItem("未选择", "")
             selected_index = 0
+            forced_index = None
+            if selected_profile_index is not None and 0 <= selected_profile_index < len(
+                self._cookie_profiles
+            ):
+                forced_index = selected_profile_index + 1
             for idx, profile in enumerate(self._cookie_profiles, start=1):
                 label = profile.remark
                 if profile.updated_at:
                     label = f"{profile.remark} ({profile.updated_at})"
                 self.cookie_profile_combo.addItem(label, profile.cookie)
-                if selected_cookie and profile.cookie == selected_cookie:
+                if (
+                    forced_index is None
+                    and selected_cookie
+                    and profile.cookie == selected_cookie
+                ):
                     selected_index = idx
+            if forced_index is not None:
+                selected_index = forced_index
             self.cookie_profile_combo.setCurrentIndex(selected_index)
         finally:
             self._cookie_profile_loading = False
@@ -282,6 +297,36 @@ class MinerGUI(QMainWindow):
         if 0 <= index < len(self._cookie_profiles):
             return index
         return None
+
+    def _find_cookie_profile_to_update(self, cookie: str, remark: str) -> int | None:
+        selected_index = self._selected_cookie_profile_index()
+        if selected_index is not None:
+            return selected_index
+        for idx, item in enumerate(self._cookie_profiles):
+            if item.cookie == cookie or item.remark == remark:
+                return idx
+        return None
+
+    def _ask_cookie_profile_save_action(self, existing: CookieProfile) -> str:
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Question)
+        msg.setWindowTitle("Cookie档案已存在")
+        msg.setText(f"已存在 Cookie 档案：{existing.remark}")
+        msg.setInformativeText("请选择覆盖已有档案，还是新建一个档案。")
+        overwrite_button = msg.addButton("覆盖", QMessageBox.AcceptRole)
+        create_button = msg.addButton("新建", QMessageBox.ActionRole)
+        cancel_button = msg.addButton("取消", QMessageBox.RejectRole)
+        msg.setDefaultButton(overwrite_button)
+        msg.exec()
+
+        clicked = msg.clickedButton()
+        if clicked == overwrite_button:
+            return "overwrite"
+        if clicked == create_button:
+            return "create"
+        if clicked == cancel_button:
+            return "cancel"
+        return "cancel"
 
     def _on_cookie_profile_selected(self, index: int) -> None:
         if self._cookie_profile_loading or index <= 0:
@@ -308,21 +353,26 @@ class MinerGUI(QMainWindow):
         remark = self.cookie_remark_edit.text().strip() or default_cookie_remark(cookie)
         profile = CookieProfile(remark=remark, cookie=cookie, updated_at=now_text())
 
-        target_index = self._selected_cookie_profile_index()
-        if target_index is None:
-            for idx, item in enumerate(self._cookie_profiles):
-                if item.cookie == cookie or item.remark == remark:
-                    target_index = idx
-                    break
+        target_index = self._find_cookie_profile_to_update(cookie, remark)
+        if target_index is not None:
+            action = self._ask_cookie_profile_save_action(
+                self._cookie_profiles[target_index]
+            )
+            if action == "cancel":
+                return
+            if action == "create":
+                target_index = None
 
         if target_index is None:
             self._cookie_profiles.append(profile)
+            saved_index = len(self._cookie_profiles) - 1
         else:
             self._cookie_profiles[target_index] = profile
+            saved_index = target_index
 
         try:
             self._write_cookie_profiles()
-            self._refresh_cookie_profile_combo(selected_cookie=cookie)
+            self._refresh_cookie_profile_combo(selected_profile_index=saved_index)
             self.cookie_remark_edit.setText(remark)
             logging.getLogger(__name__).info("Cookie已保存到 %s", cookie_store_path())
         except Exception as exc:
