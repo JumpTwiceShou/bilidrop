@@ -1,4 +1,4 @@
-APP_VERSION = "v1.5.2-cookie.2"
+APP_VERSION = "v1.6.0-cookie.1"
 UPDATE_CHANNEL = "release"
 REPOSITORY_URL = "https://github.com/JumpTwiceShou/bilidrop"
 LATEST_RELEASE_API = "https://api.github.com/repos/JumpTwiceShou/bilidrop/releases/latest"

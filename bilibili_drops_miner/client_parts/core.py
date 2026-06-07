@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 
+from bilibili_drops_miner.async_backend import ensure_anyio_asyncio_backend_ready
 from bilibili_drops_miner.client_parts.constants import (
     WBI_MIXIN_KEY_ENC_TAB,
 )
@@ -91,6 +92,8 @@ class BilibiliClient:
     MIXIN_KEY_ENC_TAB = WBI_MIXIN_KEY_ENC_TAB
 
     def __init__(self, cookie: str) -> None:
+        ensure_anyio_asyncio_backend_ready()
+
         self.cookie_map, self.cookie_header, self.bili_jct = build_cookie_state(cookie)
         self.user_agent = DEFAULT_USER_AGENT
         self.live_buvid = self._generate_live_buvid()

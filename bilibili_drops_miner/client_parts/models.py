@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(slots=True)
@@ -42,12 +42,41 @@ class LiveTraceSession:
 
 
 @dataclass(slots=True)
+class TaskCheckpointProgress:
+    sid: str
+    alias: str
+    status: int
+    cur_value: int | float
+    limit_value: int | float
+    award_name: str = ""
+    award_count: int | float = 0
+
+    @property
+    def is_completed(self) -> bool:
+        try:
+            limit = float(self.limit_value)
+            cur = float(self.cur_value)
+            if limit > 0:
+                return cur >= limit
+        except (TypeError, ValueError):
+            pass
+        return self.status in (3, 6)
+
+
+@dataclass(slots=True)
 class TaskProgress:
     task_id: str
     task_name: str
     status: int
     cur_value: int | float
     limit_value: int | float
+    check_points: list[TaskCheckpointProgress] = field(default_factory=list)
+    task_type: int = 0
+    statistic_type: int = 0
+    period_type: int = 0
+    award_type: int = 0
+    can_edit: int = 0
+    is_need_polling: int = 0
 
     @property
     def is_completed(self) -> bool:

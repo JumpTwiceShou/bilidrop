@@ -12,6 +12,7 @@ from bilibili_drops_miner.client_parts.models import (
     LiveWatchTime,
     MissionRewardClaimResult,
     MissionRewardInfo,
+    TaskCheckpointProgress,
     TaskProgress,
 )
 
@@ -23,6 +24,7 @@ __all__ = [
     "LiveWatchTime",
     "MissionRewardClaimResult",
     "MissionRewardInfo",
+    "TaskCheckpointProgress",
     "TaskProgress",
     "_coerce_task_number",
     "_extract_task_indicator_values",
