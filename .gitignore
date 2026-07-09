@@ -1,3 +1,11 @@
+# Local env and bootstrap
+.env
+.env.*
+!.env.example
+*.local
+sync.env
+.homelab/
+
 __pycache__/
 *.pyc
 build/
