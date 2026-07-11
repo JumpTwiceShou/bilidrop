@@ -20,5 +20,4 @@ nuitka-crash-report.xml
 *.exe
 config.json
 cookies.json
-AGENTS.md
 tests/
