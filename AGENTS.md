@@ -1,5 +1,7 @@
 # AGENTS.md - bilidrop
 
+<!-- homelab-project-initialization: complete -->
+
 ## Startup
 
 Read `~/.codex/SHARED_AGENT_RULES.md` and the active file under `task/` when the work requires one.
