@@ -1,6 +1,6 @@
 # Add the one-time HomeLab initialization marker
 
-- Status: active
+- Status: complete
 - Master task: `C:\dev\repos\homelab\task\2026-07-17-0255-project-initialization-gate.md`
 
 ## Scope
@@ -16,7 +16,7 @@
 
 - [x] Add exactly one completion marker to the root `AGENTS.md`.
 - [x] Validate the scoped diff and marker count.
-- [ ] Commit and push the scoped metadata change, then archive this task.
+- [x] Commit and push the scoped metadata change, then archive this task.
 
 ## Acceptance Criteria
 
@@ -37,7 +37,8 @@
 
 ## Commits
 
-- Pending.
+- `6f6eacc` — `chore: record HomeLab initialization marker` (pushed to private `origin/main`).
+- This archive commit records the verified final task result.
 
 ## Device Sync
 
@@ -45,4 +46,4 @@
 
 ## Final Result
 
-- Pending.
+- Complete. The canonical marker is present exactly once; no product content or unrelated work was included.
