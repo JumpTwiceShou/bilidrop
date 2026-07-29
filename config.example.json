@@ -1,15 +1,16 @@
 {
-  "cookie": "SESSDATA=xxxx; bili_jct=xxxx; DedeUserID=xxxx; buvid3=xxxx",
-  "room_ids": [23612045, 1017, 22608112],
-  "thread_count": 128,
+  "room_ids": [23612045],
+  "thread_count": 16,
+  "concurrency_mode": "automatic",
+  "concurrency_policy_version": 2,
   "reconnect_delay_seconds": 8,
   "enable_web_heartbeat": true,
   "task_ids": [],
   "task_query_interval_seconds": 30,
-  "notify_urls": [
-    "gotify://host/token",
-    "wxwork://corpid/agentid/secret/?to=@all",
-    "schan://SendKey"
-  ],
-  "notify_on_task_complete": true
+  "notify_on_task_complete": true,
+  "automatic_mining_enabled": false,
+  "apply_to_all_accounts": false,
+  "minimize_to_tray": true,
+  "close_to_tray": true,
+  "verbose": false
 }

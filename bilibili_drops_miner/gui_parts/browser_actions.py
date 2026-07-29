@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -16,6 +17,8 @@ from bilibili_drops_miner.gui_parts.browser_utils import (
     find_browser,
 )
 from bilibili_drops_miner.utils import extract_bili_live_task_groups
+from bilibili_drops_miner.domain import DiscoveryStatus, TaskDiscoveryResult
+from bilibili_drops_miner.task_discovery import TaskDiscoveryService
 
 
 class BrowserActions:
@@ -29,6 +32,9 @@ class BrowserActions:
         set_room_id: Callable[[int], None],
         set_cookie: Callable[[str], None],
         set_task_ids: Callable[[str], None],
+        get_room_ids: Callable[[], list[int]] | None = None,
+        get_cookie: Callable[[], str] | None = None,
+        set_discovery_status: Callable[[str, bool], None] | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._parent = parent
@@ -38,7 +44,15 @@ class BrowserActions:
         self._set_room_id = set_room_id
         self._set_cookie = set_cookie
         self._set_task_ids = set_task_ids
+        self._get_room_ids = get_room_ids or (lambda: [])
+        self._get_cookie = get_cookie or (lambda: "")
+        self._set_discovery_status = set_discovery_status or (lambda _text, _error=False: None)
         self._logger = logger or logging.getLogger(__name__)
+        self._discovery_service = TaskDiscoveryService()
+        self._discovery_cancel = threading.Event()
+        self._discovery_lock = threading.Lock()
+        self._discovery_inflight = False
+        self._preferred_browser = detect_default_browser()
 
     @staticmethod
     def find_browser(name: str) -> bool:
@@ -70,7 +84,8 @@ class BrowserActions:
             self._show_warning("提示", "未检测到 Chrome 或 Edge，请先安装浏览器。")
             return None
         if len(available) == 1:
-            return available[0]
+            self._preferred_browser = available[0]
+            return self._preferred_browser
 
         default = detect_default_browser()
         if default not in available:
@@ -104,8 +119,11 @@ class BrowserActions:
         if clicked is None or clicked == cancel_btn:
             return None
         if clicked == default_btn:
-            return default
-        return other_buttons.get(clicked, default)
+            selected = default
+        else:
+            selected = other_buttons.get(clicked, default)
+        self._preferred_browser = selected
+        return selected
 
     def apply_selected_task_group(
         self,
@@ -128,6 +146,32 @@ class BrowserActions:
             if bool(group.get("active")):
                 default_index = index
                 break
+
+        active_groups = [group for group in task_groups if bool(group.get("active"))]
+        if len(task_groups) == 1:
+            selected_group = task_groups[0]
+        elif len(active_groups) == 1:
+            selected_group = active_groups[0]
+        else:
+            selected_group = None
+
+        if selected_group is not None:
+            task_ids = [
+                str(task_id).strip()
+                for task_id in (selected_group.get("task_ids") or [])
+                if str(task_id).strip()
+            ]
+            if task_ids:
+                self._set_task_ids(",".join(task_ids))
+                self._set_discovery_status(
+                    (
+                        f"已识别当天任务组（{len(task_ids)} 个任务系列），"
+                        "正在加载全部奖励节点…"
+                    ),
+                    False,
+                )
+                self._logger.info("任务ID获取成功: %s", ",".join(task_ids))
+                return
 
         selected_option, ok = QInputDialog.getItem(
             self._parent,
@@ -157,6 +201,13 @@ class BrowserActions:
             return
 
         self._set_task_ids(",".join(task_ids))
+        self._set_discovery_status(
+            (
+                f"已识别当天任务组（{len(task_ids)} 个任务系列），"
+                "正在加载全部奖励节点…"
+            ),
+            False,
+        )
         self._logger.info(
             "任务ID获取成功: %s -> %s",
             selected_group.get("label") or f"任务组 {selected_index + 1}",
@@ -219,18 +270,93 @@ class BrowserActions:
         )
 
     def auto_fetch_task_ids(self) -> None:
-        ok = QMessageBox.question(
-            self._parent,
-            "无需登录，自动获取任务ID",
-            "支持 Chrome / Edge，将优先使用系统默认浏览器。<br><br>"
-            "点击确定后选择浏览器，并在 2 分钟内：<br><br>"
-            "打开有当前任务的直播间即可自动获取任务ID和房间号，<br>"
-            "或手动点击页面上的「刷新任务」按钮。<br><br>"
-            "捕获成功后浏览器会自动关闭。",
-            QMessageBox.Ok | QMessageBox.Cancel,
-        )
-        if ok != QMessageBox.Ok:
+        try:
+            room_ids = self._get_room_ids()
+        except Exception as exc:
+            self._show_warning("房间号错误", str(exc))
             return
+        if not room_ids:
+            self._show_warning("提示", "请先填写房间号")
+            return
+        with self._discovery_lock:
+            if self._discovery_inflight:
+                self._show_warning("提示", "任务识别正在进行中")
+                return
+            self._discovery_inflight = True
+        self._discovery_cancel.clear()
+        room_id = room_ids[0]
+        cookie = self._get_cookie().strip()
+        preferred_browser = self._preferred_browser
+        self._set_discovery_status(f"正在后台识别房间 {room_id} 的任务…", False)
+
+        def _do() -> None:
+            try:
+                result = self._discovery_service.discover(
+                    room_id,
+                    timeout_seconds=30,
+                    headless=True,
+                    cookie=cookie,
+                    browser_preference=preferred_browser,
+                    cancel_event=self._discovery_cancel,
+                )
+                self._post_ui_task(self._handle_background_discovery, result)
+            finally:
+                with self._discovery_lock:
+                    self._discovery_inflight = False
+
+        threading.Thread(
+            target=_do,
+            daemon=True,
+            name="bili-task-discovery",
+        ).start()
+
+    def _handle_background_discovery(self, result: TaskDiscoveryResult) -> None:
+        if result.succeeded:
+            groups = [
+                {
+                    "label": group.label,
+                    "task_ids": list(group.task_ids),
+                    "active": group.active,
+                }
+                for group in result.groups
+            ]
+            self.apply_selected_task_group(result.room_id, groups)
+            return
+        if result.status == DiscoveryStatus.CANCELLED:
+            self._set_discovery_status(result.message, False)
+            return
+        self._set_discovery_status(
+            "后台识别未完成，正在启动可见浏览器兜底…",
+            False,
+        )
+        self._logger.info(
+            "后台任务识别未完成，自动切换可见浏览器兜底: %s",
+            result.message or result.status.value,
+        )
+        self._visible_auto_fetch_task_ids(
+            result.room_id,
+            confirm=False,
+        )
+
+    def _visible_auto_fetch_task_ids(
+        self,
+        room_id: int | None = None,
+        *,
+        confirm: bool = True,
+    ) -> None:
+        if confirm:
+            ok = QMessageBox.question(
+                self._parent,
+                "无需登录，自动获取任务ID",
+                "支持 Chrome / Edge，将优先使用系统默认浏览器。<br><br>"
+                "点击确定后选择浏览器，并在 2 分钟内：<br><br>"
+                "打开有当前任务的直播间即可自动获取任务ID和房间号，<br>"
+                "或手动点击页面上的「刷新任务」按钮。<br><br>"
+                "捕获成功后浏览器会自动关闭。",
+                QMessageBox.Ok | QMessageBox.Cancel,
+            )
+            if ok != QMessageBox.Ok:
+                return
 
         browser = self.pick_browser()
         if browser is None:
@@ -278,6 +404,18 @@ class BrowserActions:
             browser_preference=browser,
             finish_on_any=True,
         )
+
+    def cancel_discovery(self) -> None:
+        self._discovery_cancel.set()
+
+    def rediscover_task_ids(self) -> None:
+        try:
+            room_ids = self._get_room_ids()
+        except Exception:
+            room_ids = []
+        if room_ids:
+            self._discovery_service.invalidate(room_ids[0])
+        self.auto_fetch_task_ids()
 
     def auto_fetch_cookie(self) -> None:
         ok = QMessageBox.question(

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
+from pathlib import Path
 from typing import Iterable
+
+
+PYINSTALLER_REQUIREMENT = "PyInstaller==6.20.0"
 
 
 def ensure_pyinstaller() -> None:
@@ -11,7 +16,9 @@ def ensure_pyinstaller() -> None:
         import PyInstaller  # noqa: F401
     except ImportError:
         print("PyInstaller not found, installing...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", PYINSTALLER_REQUIREMENT]
+        )
 
 
 def format_cmd(cmd: list[str]) -> str:
@@ -75,7 +82,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--release",
         action="store_true",
-        help="build release version as a single exe. Default is development build (onedir).",
+        help="compatibility flag; builds the default single-file output.",
+    )
+    parser.add_argument(
+        "--onedir",
+        action="store_true",
+        help="build an unpacked development directory instead of the default single exe.",
     )
     parser.add_argument(
         "--clean",
@@ -93,6 +105,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="enable PyInstaller debug log output.",
     )
+    parser.add_argument(
+        "--name-suffix",
+        default="",
+        help="append a suffix to output names so a running build is not overwritten.",
+    )
     return parser.parse_args()
 
 
@@ -100,7 +117,15 @@ def main() -> None:
     args = parse_args()
     ensure_pyinstaller()
 
-    is_release = args.release
+    onefile = not args.onedir
+    suffix = args.name_suffix.strip().strip("-")
+    if suffix and any(char in suffix for char in "\\/:*?\"<>|"):
+        raise ValueError("--name-suffix 包含 Windows 文件名不支持的字符")
+    gui_name = "bilibili-drops-miner-gui"
+    cli_name = "bilibili-drops-miner-cli"
+    if suffix:
+        gui_name = f"{gui_name}-{suffix}"
+        cli_name = f"{cli_name}-{suffix}"
 
     # 发布包使用 notifier.py 里的轻量内置通知，避免把 Apprise 的全量插件
     # 都塞进包里。源码环境仍可通过 Apprise 回退支持更多通知渠道。
@@ -125,22 +150,49 @@ def main() -> None:
         "tkinter",
         "--exclude-module",
         "traitlets",
+        "--exclude-module",
+        "pytest",
+        "--exclude-module",
+        "_pytest",
     ]
     common_extra_args = unused_optional_excludes + ["--exclude-module", "apprise"]
 
+    icon_png = Path("assets/bilibili.png")
+    icon_ico = Path("assets/bilibili.ico")
+    tray_icon_png = Path("assets/bilibili-tray.png")
+    tray_icon_ico = Path("assets/bilibili-tray.ico")
     gui_extra_args = common_extra_args + [
-        "--collect-submodules",
-        "selenium",
-        "--collect-binaries",
-        "selenium",
+        "--icon",
+        str(icon_ico),
+        "--add-data",
+        f"{icon_png}{os.pathsep}assets",
+        "--add-data",
+        f"{tray_icon_png}{os.pathsep}assets",
+        "--add-data",
+        f"{tray_icon_ico}{os.pathsep}assets",
+        # Selenium 4 lazy-loads browser classes. Include only the two browsers
+        # this Windows GUI actually supports; the Selenium hook still carries
+        # its required manager binary/data files.
+        "--hidden-import",
+        "selenium.webdriver.chrome.webdriver",
+        "--hidden-import",
+        "selenium.webdriver.chrome.options",
+        "--hidden-import",
+        "selenium.webdriver.chrome.service",
+        "--hidden-import",
+        "selenium.webdriver.edge.webdriver",
+        "--hidden-import",
+        "selenium.webdriver.edge.options",
+        "--hidden-import",
+        "selenium.webdriver.edge.service",
     ]
 
     if args.target in ("gui", "all"):
         build(
             "bilibili_gui.py",
-            "bilibili-drops-miner-gui",
+            gui_name,
             windowed=True,
-            onefile=is_release,
+            onefile=onefile,
             clean=args.clean,
             noupx=True,
             debug=args.debug,
@@ -150,15 +202,15 @@ def main() -> None:
     if args.target in ("cli", "all"):
         build(
             "bilibili.py",
-            "bilibili-drops-miner-cli",
-            onefile=is_release,
+            cli_name,
+            onefile=onefile,
             clean=False,  # 避免第二个目标再次清缓存
             noupx=True,
             debug=args.debug,
             extra_args=common_extra_args,
         )
 
-    mode = "release" if is_release else "development"
+    mode = "single-file" if onefile else "development-directory"
     print(f"\nAll builds complete. Mode: {mode}. Output in dist/")
 
 

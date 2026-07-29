@@ -3,40 +3,170 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from dataclasses import dataclass
+from collections.abc import Callable
+from concurrent.futures import Future
+from dataclasses import dataclass, replace
+from time import monotonic, time
 
+from bilibili_drops_miner.adaptive_concurrency import (
+    AdaptiveConcurrencyController,
+)
 from bilibili_drops_miner.client import BilibiliClient
 from bilibili_drops_miner.config import MinerConfig
+from bilibili_drops_miner.domain import ApplicationState, RuntimeHealth, TaskSnapshot
+from bilibili_drops_miner.logging_utils import redact_sensitive_text
 from bilibili_drops_miner.notifier import MultiPlatformNotifier
+from bilibili_drops_miner.task_monitor import AccountTaskMonitor
 from bilibili_drops_miner.x25kn_worker import X25KnWorker
 
 LOGGER = logging.getLogger(__name__)
 
+HealthCallback = Callable[[RuntimeHealth], None]
+TaskSnapshotCallback = Callable[[TaskSnapshot], None]
 
-@dataclass(slots=True)
+
+@dataclass(frozen=True, slots=True)
 class SessionPlan:
     room_id: int
     session_no: int
 
 
 class BilibiliWatchTimeMiner:
-    def __init__(self, config: MinerConfig) -> None:
-        self.config = config
-        self._stop_event = threading.Event()
-        self._threads: list[threading.Thread] = []
-        self._uid: int | None = None
-        self._uname: str = ""
-        self._notifier = MultiPlatformNotifier(config.notify_urls)
-        self._clients: list[BilibiliClient] = []
-        self._clients_lock = threading.Lock()
-        self._force_stop_requested = False
+    """Run all room sessions in one owned asyncio event loop."""
 
-    def _build_session_plans(self) -> list[SessionPlan]:
-        plans: list[SessionPlan] = []
-        for room_id in self.config.room_ids:
-            for session_no in range(1, self.config.thread_count + 1):
-                plans.append(SessionPlan(room_id=room_id, session_no=session_no))
-        return plans
+    def __init__(
+        self,
+        config: MinerConfig,
+        *,
+        on_health: HealthCallback | None = None,
+        on_task_snapshot: TaskSnapshotCallback | None = None,
+    ) -> None:
+        self.config = config
+        self._on_health = on_health
+        self._on_task_snapshot = on_task_snapshot
+        self._thread_stop_event = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._async_stop_event: asyncio.Event | None = None
+        self._task_monitor: AccountTaskMonitor | None = None
+        self._session_tasks: dict[SessionPlan, asyncio.Task] = {}
+        self._adaptive_controller: AdaptiveConcurrencyController | None = None
+        self._running = False
+        self._health = RuntimeHealth()
+        self._notifier = MultiPlatformNotifier(config.notify_urls)
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    @property
+    def health(self) -> RuntimeHealth:
+        return self._health
+
+    def _build_session_plans(
+        self,
+        sessions_per_room: int | None = None,
+    ) -> list[SessionPlan]:
+        count = sessions_per_room or self.config.thread_count
+        return [
+            SessionPlan(room_id=room_id, session_no=session_no)
+            for room_id in self.config.room_ids
+            for session_no in range(1, count + 1)
+        ]
+
+    def run(self) -> None:
+        if self._running:
+            raise RuntimeError("miner 已在运行")
+        self.config.validate()
+        self._thread_stop_event.clear()
+        self._running = True
+        failure = ""
+        try:
+            asyncio.run(self._run_async())
+        except Exception as exc:
+            failure = redact_sensitive_text(str(exc)) or type(exc).__name__
+            raise
+        finally:
+            self._loop = None
+            self._async_stop_event = None
+            self._task_monitor = None
+            self._session_tasks = {}
+            self._adaptive_controller = None
+            self._running = False
+            self._set_health(
+                state=ApplicationState.ERROR if failure else ApplicationState.IDLE,
+                active_sessions=0,
+                last_error=failure,
+            )
+
+    async def _run_async(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._async_stop_event = asyncio.Event()
+        if self.config.concurrency_mode == "automatic":
+            self._adaptive_controller = AdaptiveConcurrencyController(
+                task_started_at=self.config.task_started_at,
+            )
+            sessions_per_room = self._adaptive_controller.target_sessions
+            concurrency_phase = self._adaptive_controller.phase
+            concurrency_detail = self._adaptive_controller.status_detail
+        else:
+            sessions_per_room = self.config.thread_count
+            concurrency_phase = "fixed"
+            concurrency_detail = (
+                f"固定并发：每房间 {sessions_per_room} 个会话"
+            )
+        plans = self._build_session_plans(sessions_per_room)
+        self._set_health(
+            state=ApplicationState.STARTING,
+            target_sessions=len(plans),
+            active_sessions=0,
+            reconnect_count=0,
+            last_error="",
+            concurrency_mode=self.config.concurrency_mode,
+            concurrency_phase=concurrency_phase,
+            concurrency_detail=concurrency_detail,
+        )
+
+        uid, uname = await self._probe_login()
+        if uid:
+            LOGGER.info("登录成功: %s (UID: %s)", uname, uid)
+        else:
+            LOGGER.warning("Cookie 未登录，将以游客模式运行")
+
+        monitor_client = BilibiliClient(self.config.cookie)
+        account_label = uname.strip() or "Bilibili 账号"
+        if uid:
+            account_label = f"{account_label}（UID {uid}）"
+        self._task_monitor = AccountTaskMonitor(
+            client=monitor_client,
+            notifier=self._notifier,
+            config=self.config,
+            account_label=account_label,
+            on_snapshot=self._handle_task_snapshot,
+        )
+        monitor_task = asyncio.create_task(
+            self._task_monitor.run(), name="account-task-monitor"
+        )
+        self._resize_session_tasks(sessions_per_room)
+        self._set_health(state=ApplicationState.RUNNING)
+        LOGGER.info(
+            "开始运行: 房间 %s，每房间 %s 个连接，模式 %s（单一异步运行时）",
+            self.config.room_ids,
+            sessions_per_room,
+            self.config.concurrency_mode,
+        )
+
+        try:
+            await self._async_stop_event.wait()
+        finally:
+            await self._task_monitor.stop()
+            session_tasks = list(self._session_tasks.values())
+            for task in session_tasks:
+                task.cancel()
+            self._session_tasks.clear()
+            monitor_task.cancel()
+            await asyncio.gather(*session_tasks, monitor_task, return_exceptions=True)
+            await monitor_client.close()
+            LOGGER.info("所有异步连接已停止")
 
     async def _probe_login(self) -> tuple[int | None, str]:
         client = BilibiliClient(self.config.cookie)
@@ -45,165 +175,168 @@ class BilibiliWatchTimeMiner:
         finally:
             await client.close()
 
-    async def _thread_loop(self, plan: SessionPlan, thread_index: int) -> None:
-        # 1s stagger is the bench-verified floor under 128 threads: 0.5s triggers server throttle, 0.75s exhausts local proxy.
-        if thread_index > 1 and await asyncio.to_thread(
-            self._stop_event.wait, (thread_index - 1) * 1
-        ):
+    async def _session_loop(self, plan: SessionPlan, index: int) -> None:
+        # Start at a bounded rate instead of creating a synchronized request burst.
+        delay = (index - 1) * 0.25
+        if delay and await self._wait_or_stop(delay):
             return
-        if self._stop_event.is_set():
-            return
-
         client = BilibiliClient(self.config.cookie)
-        with self._clients_lock:
-            self._clients.append(client)
-
-        worker: X25KnWorker | None = None
-        task: asyncio.Task[None] | None = None
-        try:
-            if self._uid is None:
-                uid, _ = await client.get_self_info()
-                self._uid = uid or 0
-            runtime_uid = self._uid or 0
-
-            worker = X25KnWorker(
-                client=client,
-                notifier=self._notifier,
-                config=self.config,
-                uid=runtime_uid,
-                room_id=plan.room_id,
-                session_id=f"s{plan.session_no}",
-                primary_session=plan.session_no == 1,
-            )
-            task = asyncio.create_task(
-                worker.run_forever(),
-                name=f"x25kn-{plan.room_id}-s{plan.session_no}",
-            )
-            LOGGER.info("直播间 %s 连接 #%s 已启动", plan.room_id, plan.session_no)
-
-            while not self._stop_event.is_set():
-                if await asyncio.to_thread(self._stop_event.wait, 1):
-                    break
-        finally:
-            if worker is not None:
-                try:
-                    await worker.stop()
-                except Exception:
-                    LOGGER.debug(
-                        "停止 worker 失败 room=%s session=%s",
-                        plan.room_id,
-                        plan.session_no,
-                        exc_info=True,
-                    )
-
-            if task is not None:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-
-            try:
-                await client.close()
-            except Exception:
-                LOGGER.debug(
-                    "关闭 HTTP client 失败 room=%s session=%s",
-                    plan.room_id,
-                    plan.session_no,
-                    exc_info=True,
-                )
-
-            with self._clients_lock:
-                if client in self._clients:
-                    self._clients.remove(client)
-
-    def _thread_entry(self, plan: SessionPlan, thread_index: int) -> None:
-        try:
-            asyncio.run(self._thread_loop(plan, thread_index))
-        except Exception as exc:
-            LOGGER.exception("直播间连接异常退出: %s", exc)
-            self._stop_event.set()
-
-    def run(self) -> None:
-        self._stop_event.clear()
-        self._force_stop_requested = False
-
-        uid, uname = asyncio.run(self._probe_login())
-        self._uid = uid
-        self._uname = uname
-        if uid:
-            LOGGER.info("登录成功: %s (UID: %s)", uname, uid)
-        else:
-            LOGGER.warning("Cookie 未登录，将以游客模式运行")
-
-        plans = self._build_session_plans()
-        LOGGER.info(
-            "开始运行: 房间 %s，每房间 %s 个连接",
-            self.config.room_ids,
-            self.config.thread_count,
+        worker = X25KnWorker(
+            client=client,
+            config=self.config,
+            room_id=plan.room_id,
+            session_id=f"s{plan.session_no}",
+            stop_event=self._async_stop_event,
+            on_heartbeat=self._on_heartbeat,
+            on_reconnect=self._on_reconnect,
         )
-        if self.config.task_ids:
-            LOGGER.info(
-                "任务追踪已开启，每 %s 秒查询一次",
-                self.config.task_query_interval_seconds,
-            )
-        else:
-            LOGGER.info("任务追踪未开启（未设置任务 ID）")
-
-        if self._notifier.enabled:
-            LOGGER.info("通知推送已开启（%s 个地址）", len(self.config.notify_urls))
-        elif self.config.notify_urls:
-            LOGGER.warning("通知地址已配置但推送服务不可用")
-
-        self._threads.clear()
-        for thread_index, plan in enumerate(plans, start=1):
-            thread = threading.Thread(
-                target=self._thread_entry,
-                args=(plan, thread_index),
-                name=f"room-{plan.room_id}-s{plan.session_no}",
-                daemon=True,
-            )
-            thread.start()
-            self._threads.append(thread)
-
+        self._set_health(active_sessions=self._health.active_sessions + 1)
         try:
-            while not self._stop_event.is_set():
-                if not any(thread.is_alive() for thread in self._threads):
-                    break
-                for thread in self._threads:
-                    thread.join(timeout=0.5)
-        except KeyboardInterrupt:
-            LOGGER.info("收到停止信号，正在停止...")
-            self.stop()
+            await worker.run_forever()
         finally:
-            self.stop(force=self._force_stop_requested)
-            join_timeout = 1.2 if self._force_stop_requested else 3.0
-            for thread in self._threads:
-                thread.join(timeout=join_timeout)
+            await client.close()
+            self._set_health(
+                active_sessions=max(0, self._health.active_sessions - 1)
+            )
 
-            alive_threads = [thread.name for thread in self._threads if thread.is_alive()]
-            if alive_threads:
-                preview = ", ".join(alive_threads[:5])
-                if len(alive_threads) > 5:
-                    preview += f" ... 共 {len(alive_threads)} 个"
-                LOGGER.warning("停止未完成，仍有线程未退出: %s", preview)
-            else:
-                LOGGER.info("所有连接已停止")
-
-            self._threads.clear()
-            with self._clients_lock:
-                self._clients.clear()
+    async def _wait_or_stop(self, timeout: float) -> bool:
+        if self._async_stop_event is None:
+            return True
+        try:
+            await asyncio.wait_for(self._async_stop_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     def stop(self, *, force: bool = False) -> None:
-        # Keep GUI compatibility: force flag is accepted and can tighten join budget.
-        if force:
-            self._force_stop_requested = True
-        self._stop_event.set()
+        del force  # cancellation is deterministic; force is retained for API compatibility
+        self._thread_stop_event.set()
+        loop = self._loop
+        stop_event = self._async_stop_event
+        if loop is not None and stop_event is not None and loop.is_running():
+            loop.call_soon_threadsafe(stop_event.set)
+        self._set_health(state=ApplicationState.STOPPING)
+
+    def request_task_refresh(self) -> bool:
+        loop = self._loop
+        monitor = self._task_monitor
+        if loop is None or monitor is None or not loop.is_running():
+            return False
+        loop.call_soon_threadsafe(monitor.request_refresh)
+        return True
+
+    def update_task_ids(self, task_ids: list[str]) -> bool:
+        loop = self._loop
+        monitor = self._task_monitor
+        if loop is None or monitor is None or not loop.is_running():
+            self.config.task_ids = list(task_ids)
+            return False
+
+        def apply() -> None:
+            self.config.task_ids = list(task_ids)
+            monitor.request_refresh()
+
+        loop.call_soon_threadsafe(apply)
+        return True
+
+    def set_target_sessions_per_room(self, target: int) -> bool:
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return False
+        bounded = max(1, min(128, int(target)))
+        loop.call_soon_threadsafe(self._resize_session_tasks, bounded)
+        return True
+
+    def claim_rewards(self) -> Future | None:
+        loop = self._loop
+        monitor = self._task_monitor
+        if loop is None or monitor is None or not loop.is_running():
+            return None
+        return asyncio.run_coroutine_threadsafe(monitor.claim_rewards(), loop)
+
+    def claim_reward_task_ids(self, task_ids: list[str]) -> Future | None:
+        loop = self._loop
+        monitor = self._task_monitor
+        if loop is None or monitor is None or not loop.is_running():
+            return None
+        return asyncio.run_coroutine_threadsafe(
+            monitor.claim_reward_task_ids(task_ids),
+            loop,
+        )
 
     def update_cookie(self, new_cookie: str) -> None:
+        if self._running:
+            raise RuntimeError("运行中不能切换账号，请先停止")
         self.config.cookie = new_cookie
-        with self._clients_lock:
-            clients = list(self._clients)
-        for client in clients:
-            client.update_cookie(new_cookie)
 
     def update_notifier(self, notify_urls: list[str]) -> None:
-        self.config.notify_urls = notify_urls
+        if self._running:
+            raise RuntimeError("运行中不能修改通知地址，请先停止")
+        self.config.notify_urls = list(notify_urls)
         self._notifier.update_urls(notify_urls)
+
+    def _on_heartbeat(self, _room_id: int) -> None:
+        self._set_health(last_heartbeat_at=time(), last_error="")
+
+    def _on_reconnect(self, _room_id: int, detail: str) -> None:
+        self._set_health(
+            reconnect_count=self._health.reconnect_count + 1,
+            last_error=detail,
+        )
+
+    def _handle_task_snapshot(self, snapshot: TaskSnapshot) -> None:
+        if self._on_task_snapshot is not None:
+            try:
+                self._on_task_snapshot(snapshot)
+            except Exception:
+                LOGGER.exception("任务快照回调失败")
+        controller = self._adaptive_controller
+        if controller is None:
+            return
+        previous = self._health.target_sessions
+        sessions_per_room = controller.observe(
+            snapshot,
+            observed_at=monotonic(),
+        )
+        desired_total = sessions_per_room * len(self.config.room_ids)
+        if desired_total != previous:
+            LOGGER.info(
+                "自动并发调整: 每房间 %s 个连接（总计 %s）; %s",
+                sessions_per_room,
+                desired_total,
+                controller.status_detail,
+            )
+            self._resize_session_tasks(sessions_per_room)
+        self._set_health(
+            concurrency_mode="automatic",
+            concurrency_phase=controller.phase,
+            concurrency_detail=controller.status_detail,
+        )
+
+    def _resize_session_tasks(self, sessions_per_room: int) -> None:
+        if self._async_stop_event is None or self._async_stop_event.is_set():
+            return
+        plans = set(self._build_session_plans(sessions_per_room))
+        for plan in tuple(self._session_tasks):
+            if plan in plans:
+                continue
+            task = self._session_tasks.pop(plan)
+            task.cancel()
+        for plan in sorted(
+            plans - self._session_tasks.keys(),
+            key=lambda item: (item.room_id, item.session_no),
+        ):
+            self._session_tasks[plan] = asyncio.create_task(
+                self._session_loop(plan, plan.session_no),
+                name=f"room-{plan.room_id}-s{plan.session_no}",
+            )
+        self._set_health(target_sessions=len(plans))
+
+    def _set_health(self, **changes) -> None:
+        self._health = replace(self._health, **changes)
+        if self._on_health is None:
+            return
+        try:
+            self._on_health(self._health)
+        except Exception:
+            LOGGER.exception("运行状态回调失败")

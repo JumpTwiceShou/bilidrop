@@ -20,4 +20,5 @@ nuitka-crash-report.xml
 *.exe
 config.json
 cookies.json
-tests/
+credentials.json
+cookies.json*.legacy.bak

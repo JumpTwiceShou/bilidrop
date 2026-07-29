@@ -3,10 +3,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from typing import Literal
 
 from bilibili_drops_miner.config import MinerConfig
 from bilibili_drops_miner.miner import BilibiliWatchTimeMiner
+from bilibili_drops_miner.domain import RuntimeHealth, TaskSnapshot
 
 StopRequestResult = Literal[
     "not_running",
@@ -36,13 +38,24 @@ class WorkerController:
     def has_thread(self) -> bool:
         return self.worker_thread is not None
 
-    def start(self, config: MinerConfig, *, logger: logging.Logger) -> bool:
+    def start(
+        self,
+        config: MinerConfig,
+        *,
+        logger: logging.Logger,
+        on_health: Callable[[RuntimeHealth], None] | None = None,
+        on_task_snapshot: Callable[[TaskSnapshot], None] | None = None,
+    ) -> bool:
         self.stop_signal_set = False
         self._reset_stop_state()
         if self.is_running:
             return False
 
-        self.miner = BilibiliWatchTimeMiner(config)
+        self.miner = BilibiliWatchTimeMiner(
+            config,
+            on_health=on_health,
+            on_task_snapshot=on_task_snapshot,
+        )
 
         def runner() -> None:
             try:
@@ -52,7 +65,7 @@ class WorkerController:
                 logger.exception("GUI worker crashed")
 
         self.worker_thread = threading.Thread(
-            target=runner, name="gui-main-worker", daemon=True
+            target=runner, name="gui-main-worker", daemon=False
         )
         self.worker_thread.start()
         return True
@@ -114,6 +127,29 @@ class WorkerController:
         self.miner = None
         self._reset_stop_state()
         return "stopped"
+
+    def request_task_refresh(self) -> bool:
+        return bool(self.miner and self.miner.request_task_refresh())
+
+    def claim_rewards(self):
+        if self.miner is None:
+            return None
+        return self.miner.claim_rewards()
+
+    def claim_reward_task_ids(self, task_ids: list[str]):
+        if self.miner is None:
+            return None
+        return self.miner.claim_reward_task_ids(task_ids)
+
+    def update_task_ids(self, task_ids: list[str]) -> bool:
+        if self.miner is None:
+            return False
+        return self.miner.update_task_ids(task_ids)
+
+    def set_target_sessions_per_room(self, target: int) -> bool:
+        if self.miner is None:
+            return False
+        return self.miner.set_target_sessions_per_room(target)
 
     def _reset_stop_state(self) -> None:
         self.stopping_in_progress = False

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +15,15 @@ class UpdateCheckResult:
 
 def normalize_version(value: str) -> str:
     return value.strip().lower().lstrip("v")
+
+
+def _numeric_version(value: str) -> tuple[int, ...] | None:
+    normalized = normalize_version(value)
+    match = re.fullmatch(r"(\d+(?:\.\d+)*)(?:[-+].*)?", normalized)
+    if match is None:
+        return None
+    parts = tuple(int(part) for part in match.group(1).split("."))
+    return parts + (0,) * max(0, 4 - len(parts))
 
 
 def should_check_update(app_version: str, update_channel: str) -> bool:
@@ -32,7 +42,13 @@ def parse_update_payload(
     latest_version = str(payload.get("tag_name") or "").strip()
     if not latest_version:
         return None
-    if normalize_version(latest_version) == normalize_version(current_version):
+    latest_numeric = _numeric_version(latest_version)
+    current_numeric = _numeric_version(current_version)
+    if (
+        latest_numeric is None
+        or current_numeric is None
+        or latest_numeric <= current_numeric
+    ):
         return None
     release_url = str(payload.get("html_url") or "").strip() or releases_url
     return UpdateCheckResult(latest_version=latest_version, release_url=release_url)
@@ -70,4 +86,3 @@ def check_latest_release(
         )
     except Exception:
         return None
-

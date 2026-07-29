@@ -3,17 +3,26 @@ from __future__ import annotations
 import argparse
 import sys
 
-from bilibili_drops_miner.config import MinerConfig
+from bilibili_drops_miner.config import DEFAULT_SESSIONS_PER_ROOM, MinerConfig
 from bilibili_drops_miner.logging_utils import setup_logging
 from bilibili_drops_miner.miner import BilibiliWatchTimeMiner
-from bilibili_drops_miner.utils import parse_room_ids, parse_task_ids
+from bilibili_drops_miner.utils import (
+    parse_notification_urls,
+    parse_room_ids,
+    parse_task_ids,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Bilibili Watch-Time Miner")
     parser.add_argument("--cookie", default="", help="Bilibili cookie string")
     parser.add_argument("--rooms", default="", help="Room ids, comma/newline separated")
-    parser.add_argument("--threads", type=int, default=128, help="Sessions per room")
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=DEFAULT_SESSIONS_PER_ROOM,
+        help="Sessions per room",
+    )
     parser.add_argument(
         "--reconnect-delay", type=int, default=8, help="Reconnect delay in seconds"
     )
@@ -31,7 +40,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--notify-urls",
         default="",
-        help="Notification URLs, comma/newline separated (WeCom, Gotify, ServerChan, etc.)",
+        help=(
+            "Notification URLs, comma/newline separated "
+            "(Telegram tgram://BotToken/ChatID, WeCom, Gotify, ServerChan)"
+        ),
     )
     parser.add_argument(
         "--disable-task-notify",
@@ -69,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         cookie = _resolve_cookie(args)
         room_ids = _resolve_rooms(args)
         task_ids = parse_task_ids(args.task_ids)
-        notify_urls = parse_task_ids(args.notify_urls)
+        notify_urls = parse_notification_urls(args.notify_urls)
         config = MinerConfig(
             cookie=cookie,
             room_ids=room_ids,

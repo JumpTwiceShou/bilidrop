@@ -16,7 +16,16 @@ class _NativeNotifyTarget:
     @classmethod
     def from_url(cls, service_url: str) -> _NativeNotifyTarget | None:
         parsed = urlparse(service_url)
-        if parsed.scheme in {"gotify", "gotifys", "schan", "wecombot", "wxwork"}:
+        if parsed.scheme in {
+            "gotify",
+            "gotifys",
+            "schan",
+            "telegram",
+            "tg",
+            "tgram",
+            "wecombot",
+            "wxwork",
+        }:
             return cls(service_url)
         if (
             parsed.scheme in {"http", "https"}
@@ -33,6 +42,8 @@ class _NativeNotifyTarget:
                 return self._notify_gotify(title, body)
             if self.parsed.scheme == "schan":
                 return self._notify_serverchan(title, body)
+            if self.parsed.scheme in {"telegram", "tg", "tgram"}:
+                return self._notify_telegram(title, body)
             if self.parsed.scheme == "wecombot" or self._is_wecombot_webhook():
                 return self._notify_wecombot(title, body)
             if self.parsed.scheme == "wxwork":
@@ -76,6 +87,32 @@ class _NativeNotifyTarget:
         response = httpx.post(
             f"https://sctapi.ftqq.com/{unquote(token)}.send",
             data={"title": title, "desp": body},
+            timeout=10.0,
+        )
+        return self._is_success_response(response)
+
+    def _notify_telegram(self, title: str, body: str) -> bool:
+        token = unquote(self.parsed.netloc)
+        path_parts = [
+            unquote(part) for part in self.parsed.path.split("/") if part
+        ]
+        if not token or not path_parts:
+            raise ValueError("Telegram 通知地址需要 Bot Token 和 Chat ID")
+
+        payload: dict[str, str | int] = {
+            "chat_id": path_parts[0],
+            "text": self._format_content(title, body),
+        }
+        query = parse_qs(self.parsed.query)
+        thread_id = query.get("thread", query.get("message_thread_id", [""]))[0]
+        if thread_id:
+            payload["message_thread_id"] = (
+                int(thread_id) if thread_id.isdigit() else thread_id
+            )
+
+        response = httpx.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json=payload,
             timeout=10.0,
         )
         return self._is_success_response(response)
@@ -153,6 +190,10 @@ class _NativeNotifyTarget:
             payload = response.json()
         except ValueError:
             return True
+
+        if payload.get("ok") is False:
+            LOGGER.warning("通知发送失败，远端服务返回失败状态")
+            return False
 
         error_code = payload.get("errcode", payload.get("code"))
         if error_code not in (None, 0):

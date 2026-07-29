@@ -17,27 +17,47 @@ from bilibili_drops_miner.client_parts.task_parsing import (
 
 
 def normalize_task_ids(task_ids: list[str]) -> list[str]:
-    return [task_id.strip() for task_id in task_ids if task_id.strip()]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for task_id in task_ids:
+        value = task_id.strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
 
 
 def parse_task_checkpoints(check_points: Any) -> list[TaskCheckpointProgress]:
     checkpoints: list[TaskCheckpointProgress] = []
     for item in normalize_checkpoint_candidates(check_points):
         sid = str(
-            first_present_value(item, ("sid", "task_id", "id", "checkpoint_id"))
+            first_present_value(
+                item,
+                ("sid", "ztasksid", "task_id", "id", "checkpoint_id"),
+            )
             or ""
         )
         alias = str(
-            first_present_value(item, ("alias", "task_name", "name", "title"))
+            first_present_value(
+                item,
+                ("alias", "task_name", "name", "title", "task_desc"),
+            )
             or sid
         )
         status = coerce_task_int(first_present_value(item, ("status", "task_status")))
         cur_value, limit_value = extract_checkpoint_progress_values(item)
+        award = item.get("award") or item.get("reward_info") or {}
+        if not isinstance(award, dict):
+            award = {}
         award_name = str(
-            first_present_value(item, ("award_name", "reward_name")) or ""
+            first_present_value(item, ("award_name", "reward_name"))
+            or first_present_value(award, ("award_name", "reward_name", "name", "title"))
+            or ""
         )
         award_count = coerce_task_number(
             first_present_value(item, ("count", "award_count", "num"))
+            or first_present_value(award, ("count", "award_count", "num"))
         )
         checkpoints.append(
             TaskCheckpointProgress(

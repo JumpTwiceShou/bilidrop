@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from PySide6.QtGui import QFont
+import sys
+
+from PySide6.QtGui import QFont, QFontDatabase
 from PySide6.QtWidgets import QApplication
 
 
@@ -16,7 +18,7 @@ APP_STYLE_SHEET = """
             padding: 6px 10px; min-height: 20px;
             selection-background-color: #4f8cff;
         }
-        QLineEdit:focus { border-color: #4f8cff; }
+        QLineEdit:focus { border-color: #566071; background: #2e3340; }
         QLineEdit:disabled { color: #6b7280; background: #23262e; }
 
         QComboBox {
@@ -25,13 +27,40 @@ APP_STYLE_SHEET = """
             padding: 6px 10px; min-height: 20px;
             selection-background-color: #4f8cff;
         }
-        QComboBox:focus { border-color: #4f8cff; }
+        QComboBox:focus { border-color: #566071; background: #2e3340; }
         QComboBox::drop-down {
             border: 0; width: 24px; background: transparent;
         }
         QComboBox QAbstractItemView {
             background: #242832; color: #e6e7eb;
             border: 1px solid #2f3440; selection-background-color: #4f8cff;
+        }
+
+        QTabWidget::pane {
+            background: #1f232b; border: 1px solid #343b48;
+            border-radius: 8px; top: -1px;
+        }
+        QTabBar::tab {
+            background: #2b303b; color: #aeb6c5;
+            border: 1px solid #343b48; border-bottom: 0;
+            padding: 9px 22px; min-width: 96px;
+        }
+        QTabBar::tab:first { border-top-left-radius: 7px; }
+        QTabBar::tab:last { border-top-right-radius: 7px; }
+        QTabBar::tab:selected {
+            background: #1f232b; color: #ffffff;
+            border-top: 2px solid #4f8cff;
+        }
+        QTabBar::tab:hover { color: #ffffff; background: #343a46; }
+
+        QTableWidget {
+            background: #1f222a; alternate-background-color: #242832;
+            color: #e6e7eb; border: 1px solid #343b48; border-radius: 6px;
+            gridline-color: #343b48; selection-background-color: #1d4ed8;
+        }
+        QHeaderView::section {
+            background: #2b303b; color: #dce1e8; border: 0;
+            border-bottom: 1px solid #3a4250; padding: 7px;
         }
 
         QPlainTextEdit {
@@ -42,14 +71,15 @@ APP_STYLE_SHEET = """
 
         QCheckBox { background: transparent; spacing: 8px; color: #e6e7eb; }
         QCheckBox::indicator {
-            width: 16px; height: 16px; border: 1px solid #3a3f4b;
-            border-radius: 4px; background: #2b2f3a;
+            width: 16px; height: 16px; border-radius: 4px;
         }
-        QCheckBox::indicator:hover { border-color: #4f8cff; }
+        QCheckBox::indicator:unchecked {
+            background: #1f232b; border: 1px solid #64748b;
+        }
         QCheckBox::indicator:checked {
-            background: #4f8cff; border-color: #4f8cff;
-            image: none;
+            background: #2563eb; border: 2px solid #93c5fd;
         }
+        QCheckBox:focus { color: #cbd5e1; border: 0; }
 
         QProgressBar {
             background: #2b2f3a; border: 0; border-radius: 4px;
@@ -96,8 +126,15 @@ APP_STYLE_SHEET = """
 
 def configure_qt_app(app: QApplication) -> None:
     app.setStyle("Fusion")
-    default_font = QFont("Segoe UI", 10)
-    # Fall back to Microsoft YaHei for CJK glyphs on Windows.
+    if sys.platform == "win32":
+        family = "Microsoft YaHei UI"
+    elif sys.platform == "darwin":
+        family = "PingFang SC"
+    else:
+        family = "Noto Sans CJK SC"
+    if family not in QFontDatabase.families():
+        family = "Segoe UI"
+    default_font = QFont(family, 10)
     default_font.setStyleStrategy(QFont.PreferAntialias)
     app.setFont(default_font)
     app.setStyleSheet(APP_STYLE_SHEET)

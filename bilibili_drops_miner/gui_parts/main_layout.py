@@ -3,25 +3,51 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QRectF, QSize, Qt
+from PySide6.QtGui import (
+    QColor,
+    QFocusEvent,
+    QFont,
+    QIntValidator,
+    QPainter,
+    QPaintEvent,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
+    QTabWidget,
+    QTableWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from bilibili_drops_miner.gui_parts.styles import CARD_STYLE, BUTTON_STYLES
+from bilibili_drops_miner.config import (
+    DEFAULT_SESSIONS_PER_ROOM,
+    MAX_RECONNECT_DELAY_SECONDS,
+    MAX_SESSIONS_PER_ROOM,
+    MAX_TASK_QUERY_INTERVAL_SECONDS,
+    MIN_RECONNECT_DELAY_SECONDS,
+    MIN_TASK_QUERY_INTERVAL_SECONDS,
+)
+from bilibili_drops_miner.gui_parts.styles import (
+    BUTTON_STYLES,
+    CARD_STYLE,
+    DISABLED_BUTTON_STYLE,
+)
 
 
 @dataclass(slots=True)
@@ -29,8 +55,9 @@ class MainWindowCallbacks:
     auto_fetch_cookie: Callable[..., None]
     auto_fetch_room_id: Callable[..., None]
     auto_fetch_task_ids: Callable[..., None]
-    start: Callable[..., None]
-    stop: Callable[..., None]
+    auto_fetch_overwatch_esports: Callable[..., None]
+    toggle_run: Callable[..., None]
+    toggle_background_auto: Callable[..., None]
     load_config: Callable[..., None]
     save_config: Callable[..., None]
     select_cookie_profile: Callable[..., None]
@@ -39,7 +66,11 @@ class MainWindowCallbacks:
     clear_logs: Callable[..., None]
     claim_rewards: Callable[..., None]
     refresh_tasks: Callable[..., None]
-    toggle_log: Callable[..., None]
+    open_settings_log: Callable[..., None]
+    toggle_cookie_visibility: Callable[..., None]
+    toggle_notify_visibility: Callable[..., None]
+    test_notification: Callable[..., None]
+    export_diagnostics: Callable[..., None]
 
 
 @dataclass(slots=True)
@@ -50,211 +81,431 @@ class MainWindowWidgets:
     notify_urls_edit: QLineEdit
     cookie_profile_combo: QComboBox
     cookie_remark_edit: QLineEdit
-    threads_edit: QLineEdit
-    reconnect_edit: QLineEdit
-    task_interval_edit: QLineEdit
+    threads_spin: NumericLineEdit
+    reconnect_spin: NumericLineEdit
+    task_interval_spin: NumericLineEdit
     verbose_check: QCheckBox
     disable_task_notify_check: QCheckBox
     progress_bar: QProgressBar
-    task_text: QPlainTextEdit
+    task_table: QTableWidget
     log_text: QPlainTextEdit
-    log_card: QFrame
-    log_toggle_btn: QPushButton
+    settings_dialog: QDialog
+    settings_tabs: QTabWidget
+    settings_button: QPushButton
     claim_rewards_btn: QPushButton
+    start_btn: QPushButton
+    enable_auto_btn: QPushButton
+    apply_all_switch: ToggleSwitch
+    auto_mining_description: QLabel
+    concurrency_mode_combo: QComboBox
+    minimize_to_tray_check: QCheckBox
+    close_to_tray_check: QCheckBox
+    discover_btn: QPushButton
+    overwatch_esports_btn: QPushButton
+    cookie_reveal_btn: QPushButton
+    save_cookie_profile_btn: QPushButton
+    delete_cookie_profile_btn: QPushButton
+    notify_reveal_btn: QPushButton
+    runtime_state_label: QLabel
+    runtime_detail_label: QLabel
+    discovery_status_label: QLabel
+    watch_time_label: QLabel
+
+
+class NumericLineEdit(QLineEdit):
+    """A bounded integer field with no steppers or wheel-based changes."""
+
+    def __init__(self, minimum: int, maximum: int, value: int) -> None:
+        super().__init__()
+        self._minimum = minimum
+        self._maximum = maximum
+        self.setValidator(QIntValidator(minimum, maximum, self))
+        self.setInputMethodHints(Qt.ImhDigitsOnly)
+        self.setValue(value)
+
+    def value(self) -> int:
+        try:
+            value = int(self.text().strip())
+        except ValueError:
+            value = self._minimum
+        return max(self._minimum, min(self._maximum, value))
+
+    def setValue(self, value: int) -> None:
+        bounded = max(self._minimum, min(self._maximum, int(value)))
+        self.setText(str(bounded))
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        event.ignore()
+
+    def focusOutEvent(self, event: QFocusEvent) -> None:
+        self.setValue(self.value())
+        super().focusOutEvent(event)
+
+
+class ToggleSwitch(QCheckBox):
+    """Compact iOS-style boolean switch without the native focus rectangle."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setFixedSize(46, 26)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+
+    def sizeHint(self) -> QSize:
+        return QSize(46, 26)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        opacity = 1.0 if self.isEnabled() else 0.45
+        painter.setOpacity(opacity)
+        track = QRectF(1, 3, self.width() - 2, self.height() - 6)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(
+            QColor("#f59e0b" if self.isChecked() else "#4b5563")
+        )
+        painter.drawRoundedRect(
+            track,
+            track.height() / 2,
+            track.height() / 2,
+        )
+        knob_size = track.height() - 4
+        knob_x = (
+            track.right() - knob_size - 2
+            if self.isChecked()
+            else track.left() + 2
+        )
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawEllipse(
+            QRectF(knob_x, track.top() + 2, knob_size, knob_size)
+        )
 
 
 def build_main_window_layout(
     window: QMainWindow,
     callbacks: MainWindowCallbacks,
 ) -> MainWindowWidgets:
-    central = QWidget(window)
-    window.setCentralWidget(central)
-    root_layout = QVBoxLayout(central)
-    root_layout.setContentsMargins(18, 18, 18, 18)
-    root_layout.setSpacing(12)
+    scroll = QScrollArea(window)
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.NoFrame)
+    window.setCentralWidget(scroll)
+    central = QWidget()
+    scroll.setWidget(central)
+    root = QVBoxLayout(central)
+    root.setContentsMargins(20, 18, 20, 20)
+    root.setSpacing(12)
 
-    # ---- Config card ----
-    config_card = QFrame()
-    config_card.setObjectName("card")
-    config_card.setStyleSheet(CARD_STYLE)
-    config_layout = QVBoxLayout(config_card)
-    config_layout.setContentsMargins(18, 16, 18, 16)
-    config_layout.setSpacing(12)
-
+    header = QHBoxLayout()
     title = QLabel("Bilibili 直播掉宝助手")
-    title_font = QFont()
-    title_font.setPointSize(15)
-    title_font.setBold(True)
-    title.setFont(title_font)
-    title.setStyleSheet("color:#f5f6f8;padding:2px 0 6px 0;")
-    config_layout.addWidget(title)
+    title.setFont(_font(16, bold=True))
+    subtitle = QLabel("输入房间号，程序自动识别任务并管理挂机状态")
+    subtitle.setStyleSheet("color:#aeb6c5;")
+    title_stack = QVBoxLayout()
+    title_stack.setSpacing(2)
+    title_stack.addWidget(title)
+    title_stack.addWidget(subtitle)
+    header.addLayout(title_stack)
+    header.addStretch(1)
+    settings_button = _button("设置与日志", "gray", callbacks.open_settings_log)
+    settings_button.setToolTip("打开高级设置和实时运行日志")
+    header.addWidget(settings_button)
+    runtime_state_label = QLabel("未运行")
+    runtime_state_label.setObjectName("stateBadge")
+    runtime_state_label.setAlignment(Qt.AlignCenter)
+    runtime_state_label.setMinimumWidth(92)
+    runtime_state_label.setStyleSheet(
+        "background:#343a46;color:#e6e7eb;border-radius:12px;padding:6px 12px;font-weight:600;"
+    )
+    header.addWidget(runtime_state_label)
+    root.addLayout(header)
 
-    cookie_edit = _make_line_edit("必填: SESSDATA=xxx; bili_jct=xxx; DedeUserID=xxx")
-    rooms_edit = _make_line_edit("必填: 直播间号，多个用逗号分隔")
-    rooms_edit.setText("23612045")
-    task_ids_edit = _make_line_edit("可留空: F12 从 totalv2 请求中提取 task_ids")
-    notify_urls_edit = _make_line_edit("可留空: 通知 URL，如 gotify://host/token")
-
-    config_layout.addLayout(
-        _build_labeled_row(
+    account_card, account_layout = _card("1  账号")
+    cookie_profile_combo = QComboBox()
+    cookie_profile_combo.setAccessibleName("账号档案与临时账号")
+    cookie_profile_combo.currentIndexChanged.connect(callbacks.select_cookie_profile)
+    cookie_profile_combo.setMinimumWidth(260)
+    cookie_profile_combo.setMaximumWidth(520)
+    cookie_remark_edit = _line_edit("账号备注，例如主号")
+    cookie_remark_edit.setMinimumWidth(150)
+    cookie_remark_edit.setMaximumWidth(230)
+    save_cookie_profile_btn = _button(
+        "保存档案",
+        "blue",
+        callbacks.save_cookie_profile,
+    )
+    delete_cookie_profile_btn = _button(
+        "删除",
+        "gray",
+        callbacks.delete_cookie_profile,
+    )
+    account_row = QHBoxLayout()
+    account_row.setSpacing(8)
+    account_row.addWidget(_buddy_label("账号档案", cookie_profile_combo))
+    cookie_profile_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+    cookie_remark_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+    account_row.addWidget(cookie_profile_combo, 3)
+    account_row.addWidget(cookie_remark_edit, 2)
+    account_row.addWidget(save_cookie_profile_btn)
+    account_row.addWidget(delete_cookie_profile_btn)
+    account_layout.addLayout(account_row)
+    cookie_edit = _line_edit("SESSDATA、bili_jct 等登录 Cookie")
+    cookie_edit.setEchoMode(QLineEdit.Password)
+    cookie_edit.setAccessibleName("Bilibili Cookie")
+    cookie_reveal_btn = _button("显示", "gray", callbacks.toggle_cookie_visibility)
+    account_layout.addLayout(
+        _form_row(
             "Cookie",
             cookie_edit,
-            ("自动获取", "purple", callbacks.auto_fetch_cookie),
+            cookie_reveal_btn,
+            _button("扫码登录", "purple", callbacks.auto_fetch_cookie),
         )
     )
-    config_layout.addLayout(
-        _build_labeled_row(
-            "房间号",
+    root.addWidget(account_card)
+
+    room_card, room_layout = _card("2  直播与任务")
+    rooms_edit = _line_edit("直播间号或直播间 URL，多个用英文逗号分隔")
+    rooms_edit.setAccessibleName("直播间号")
+    discover_btn = _button("识别当前任务", "blue", callbacks.auto_fetch_task_ids)
+    overwatch_esports_btn = _button(
+        "守望先锋电竞",
+        "gray",
+        callbacks.auto_fetch_overwatch_esports,
+    )
+    overwatch_esports_btn.setToolTip("设置房间 23612045 并立即识别")
+    room_layout.addLayout(
+        _form_row(
+            "房间",
             rooms_edit,
-            ("自动获取", "blue", callbacks.auto_fetch_room_id),
+            _button("浏览器获取", "gray", callbacks.auto_fetch_room_id),
+            overwatch_esports_btn,
+            discover_btn,
         )
     )
-    config_layout.addLayout(
-        _build_labeled_row(
-            "任务 ID",
-            task_ids_edit,
-            ("自动获取", "blue", callbacks.auto_fetch_task_ids),
-        )
+    discovery_status_label = QLabel(
+        "填写房间号后点击“识别当前任务”；无需等待直播间开播"
     )
-    config_layout.addLayout(_build_labeled_row("通知 URL", notify_urls_edit))
+    discovery_status_label.setWordWrap(True)
+    discovery_status_label.setStyleSheet("color:#aeb6c5;padding-left:92px;")
+    room_layout.addWidget(discovery_status_label)
+    root.addWidget(room_card)
 
-    cookie_profile_combo = QComboBox()
-    cookie_profile_combo.setMinimumWidth(240)
-    cookie_profile_combo.currentIndexChanged.connect(callbacks.select_cookie_profile)
-    cookie_remark_edit = _make_line_edit("自定义备注，例如账号A/主号/小号")
-
-    cookie_profile_row = QHBoxLayout()
-    cookie_profile_row.setSpacing(8)
-    cookie_profile_label = QLabel("Cookie档案")
-    cookie_profile_label.setMinimumWidth(72)
-    cookie_profile_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
-    cookie_profile_label.setStyleSheet("color:#9aa0a6;")
-    cookie_profile_row.addWidget(cookie_profile_label)
-    cookie_profile_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-    cookie_profile_row.addWidget(cookie_profile_combo, 1)
-    cookie_remark_label = QLabel("备注")
-    cookie_remark_label.setStyleSheet("color:#9aa0a6;")
-    cookie_profile_row.addWidget(cookie_remark_label)
-    cookie_remark_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-    cookie_profile_row.addWidget(cookie_remark_edit, 1)
-    cookie_profile_row.addWidget(
-        _make_button("保存Cookie", "blue", callbacks.save_cookie_profile)
+    runtime_card, runtime_layout = _card("3  运行")
+    runtime_header = QVBoxLayout()
+    runtime_text = QVBoxLayout()
+    runtime_detail_label = QLabel("连接 0/0 · 重连 0 · 等待启动")
+    runtime_detail_label.setStyleSheet("color:#aeb6c5;")
+    runtime_detail_label.setWordWrap(True)
+    watch_time_label = QLabel()
+    watch_time_label.setVisible(False)
+    runtime_text.addWidget(runtime_detail_label)
+    runtime_header.addLayout(runtime_text)
+    action_row = QHBoxLayout()
+    action_row.setSpacing(10)
+    start_btn = _button("开始", "green", callbacks.toggle_run)
+    start_btn.setMinimumWidth(170)
+    enable_auto_btn = _button(
+        "后台自动挂机", "blue", callbacks.toggle_background_auto
     )
-    cookie_profile_row.addWidget(
-        _make_button("删除Cookie", "gray", callbacks.delete_cookie_profile)
+    enable_auto_btn.setMinimumWidth(190)
+    action_row.addWidget(start_btn)
+    action_row.addWidget(enable_auto_btn)
+    action_row.addStretch(1)
+    scope_label = QLabel("应用到所有账号")
+    scope_label.setStyleSheet("color:#c7ced9;")
+    apply_all_switch = ToggleSwitch()
+    apply_all_switch.setAccessibleName("应用到所有账号")
+    apply_all_switch.setToolTip(
+        "开启后，“开始/停止”和“后台自动挂机”都会操作所有账号"
     )
-    config_layout.addLayout(cookie_profile_row)
-
-    threads_edit = _make_small_edit("128")
-    reconnect_edit = _make_small_edit("8")
-    task_interval_edit = _make_small_edit("30")
-    verbose_check = QCheckBox("详细日志")
-    disable_task_notify_check = QCheckBox("禁用任务完成通知")
-
-    num_row = QHBoxLayout()
-    num_row.setSpacing(12)
-    for text, widget in (
-        ("线程数", threads_edit),
-        ("重连延迟(s)", reconnect_edit),
-        ("任务查询间隔(s)", task_interval_edit),
-    ):
-        lbl = QLabel(text)
-        lbl.setStyleSheet("color:#9aa0a6;")
-        num_row.addWidget(lbl)
-        num_row.addWidget(widget)
-        num_row.addSpacing(6)
-    num_row.addSpacing(6)
-    num_row.addWidget(verbose_check)
-    num_row.addWidget(disable_task_notify_check)
-    num_row.addStretch(1)
-    config_layout.addLayout(num_row)
-
-    btn_row = QHBoxLayout()
-    btn_row.setSpacing(8)
-    btn_row.addWidget(_make_button("启动", "green", callbacks.start))
-    btn_row.addWidget(_make_button("停止", "red", callbacks.stop))
-    btn_row.addWidget(_make_button("加载配置", "", callbacks.load_config))
-    btn_row.addWidget(_make_button("保存配置", "", callbacks.save_config))
-    btn_row.addWidget(_make_button("清空日志", "gray", callbacks.clear_logs))
-    btn_row.addStretch(1)
-    config_layout.addLayout(btn_row)
-
+    scope_label.setBuddy(apply_all_switch)
+    action_row.addWidget(scope_label)
+    action_row.addWidget(apply_all_switch)
+    runtime_header.addLayout(action_row)
+    auto_mining_description = QLabel(
+        "当前只操作所选账号。后台自动挂机会定时检查任务，开播后自动启动，"
+        "完成领奖后停止心跳并继续守候；每次打开程序后需要手动开启。"
+    )
+    auto_mining_description.setWordWrap(True)
+    auto_mining_description.setStyleSheet("color:#8f9bad;font-size:9pt;")
+    runtime_header.addWidget(auto_mining_description)
+    runtime_layout.addLayout(runtime_header)
     progress_bar = QProgressBar()
     progress_bar.setTextVisible(False)
-    progress_bar.setMinimumHeight(6)
-    progress_bar.setMaximumHeight(10)
-    progress_bar.setRange(0, 1)  # stopped state
+    progress_bar.setRange(0, 1)
     progress_bar.setValue(0)
     progress_bar.setVisible(False)
-    config_layout.addWidget(progress_bar)
+    runtime_layout.addWidget(progress_bar)
+    root.addWidget(runtime_card)
 
-    root_layout.addWidget(config_card)
-
-    # ---- Task progress card ----
-    task_card = QFrame()
-    task_card.setObjectName("card")
-    task_card.setStyleSheet(CARD_STYLE)
-    task_layout = QVBoxLayout(task_card)
-    task_layout.setContentsMargins(18, 12, 18, 14)
-    task_layout.setSpacing(8)
-
+    task_card, task_layout = _card("任务进度")
     task_header = QHBoxLayout()
-    task_title = QLabel("任务进度")
-    task_title_font = QFont()
-    task_title_font.setPointSize(11)
-    task_title_font.setBold(True)
-    task_title.setFont(task_title_font)
-    task_title.setStyleSheet("color:#f5f6f8;")
-    task_header.addWidget(task_title)
     task_header.addStretch(1)
-    claim_rewards_btn = _make_button("领取奖励", "blue", callbacks.claim_rewards)
+    claim_rewards_btn = _button("手动领取", "blue", callbacks.claim_rewards)
+    claim_rewards_btn.setToolTip("奖励会自动领取；自动领取失败时可在此手动重试")
+    claim_rewards_btn.setEnabled(False)
     task_header.addWidget(claim_rewards_btn)
-    task_header.addWidget(_make_button("手动刷新", "", callbacks.refresh_tasks))
+    task_header.addWidget(_button("刷新", "gray", callbacks.refresh_tasks))
     task_layout.addLayout(task_header)
+    task_table = QTableWidget(0, 5)
+    task_table.setHorizontalHeaderLabels(["任务 / 奖励节点", "进度", "状态", "奖励", "领取"])
+    task_table.setAccessibleName("任务进度列表")
+    task_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+    task_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+    task_table.setAlternatingRowColors(True)
+    task_table.verticalHeader().setVisible(False)
+    task_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+    for column in (1, 2, 3, 4):
+        task_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+    task_table.setMinimumHeight(190)
+    task_layout.addWidget(task_table)
+    root.addWidget(task_card)
+    root.addStretch(1)
 
-    task_text = QPlainTextEdit()
-    task_text.setReadOnly(True)
-    task_text.setFont(QFont("Consolas", 10))
-    task_text.setLineWrapMode(QPlainTextEdit.NoWrap)
-    task_text.setMinimumHeight(160)
-    task_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-    task_text.setPlainText("点击“手动刷新”查看任务进度")
-    task_layout.addWidget(task_text)
+    settings_dialog = QDialog(window)
+    settings_dialog.setWindowTitle("设置与日志")
+    settings_dialog.setModal(False)
+    settings_dialog.resize(900, 640)
+    settings_dialog_layout = QVBoxLayout(settings_dialog)
+    settings_dialog_layout.setContentsMargins(18, 16, 18, 18)
+    settings_dialog_layout.setSpacing(12)
+    dialog_title = QLabel("设置与日志")
+    dialog_title.setFont(_font(15, bold=True))
+    dialog_subtitle = QLabel("调整高级参数，或查看当前运行日志")
+    dialog_subtitle.setStyleSheet("color:#aeb6c5;")
+    settings_dialog_layout.addWidget(dialog_title)
+    settings_dialog_layout.addWidget(dialog_subtitle)
+    settings_tabs = QTabWidget()
+    settings_dialog_layout.addWidget(settings_tabs, 1)
 
-    root_layout.addWidget(task_card, 1)
+    advanced_scroll = QScrollArea()
+    advanced_scroll.setWidgetResizable(True)
+    advanced_scroll.setFrameShape(QFrame.NoFrame)
+    advanced_page = QWidget()
+    advanced_scroll.setWidget(advanced_page)
+    advanced_stack = QVBoxLayout(advanced_page)
+    advanced_stack.setContentsMargins(14, 14, 14, 14)
+    advanced_stack.setSpacing(10)
 
-    # ---- Log card (collapsible, default collapsed) ----
-    log_card = QFrame()
-    log_card.setObjectName("card")
-    log_card.setStyleSheet(CARD_STYLE)
-    log_layout = QVBoxLayout(log_card)
-    log_layout.setContentsMargins(18, 8, 18, 14)
-    log_layout.setSpacing(6)
-
-    log_toggle_btn = QPushButton("▶ 运行日志")
-    log_title_font = QFont()
-    log_title_font.setPointSize(11)
-    log_title_font.setBold(True)
-    log_toggle_btn.setFont(log_title_font)
-    log_toggle_btn.setFlat(True)
-    log_toggle_btn.setCursor(Qt.PointingHandCursor)
-    log_toggle_btn.setStyleSheet(
-        "QPushButton{text-align:left;padding:6px 4px;border:0;background:transparent;color:#e6e7eb;}"
-        "QPushButton:hover{color:#4f8cff;}"
+    threads_spin = _numeric_input(
+        1, MAX_SESSIONS_PER_ROOM, DEFAULT_SESSIONS_PER_ROOM
     )
-    log_toggle_btn.clicked.connect(callbacks.toggle_log)
-    log_layout.addWidget(log_toggle_btn)
+    reconnect_spin = _numeric_input(
+        MIN_RECONNECT_DELAY_SECONDS, MAX_RECONNECT_DELAY_SECONDS, 8
+    )
+    task_interval_spin = _numeric_input(
+        MIN_TASK_QUERY_INTERVAL_SECONDS, MAX_TASK_QUERY_INTERVAL_SECONDS, 30
+    )
+    connection_group, connection_layout = _settings_group(
+        "连接参数",
+        "默认值适合普通使用；并发越高越容易触发平台限频。",
+    )
+    connection_fields = QHBoxLayout()
+    connection_fields.setSpacing(12)
+    for title, control in (
+        ("每房间并发会话", threads_spin),
+        ("断线重试等待（秒）", reconnect_spin),
+        ("任务刷新间隔（秒）", task_interval_spin),
+    ):
+        connection_fields.addWidget(_field_widget(title, control), 1)
+    connection_layout.addLayout(connection_fields)
+    concurrency_mode_combo = QComboBox()
+    concurrency_mode_combo.addItem(
+        "自动调节（追赶 16，3 分钟检测后 2）", "automatic"
+    )
+    concurrency_mode_combo.addItem("固定并发", "fixed")
+    concurrency_mode_combo.setToolTip(
+        "自动模式先用 16 个心跳会话；3 分钟进度增量不足 16 时降为 2 个，"
+        "并保持到下一组新任务。后台检测到初始进度为 0 的新任务直接使用 2 个。"
+    )
+    connection_layout.addWidget(
+        _field_widget("并发模式", concurrency_mode_combo)
+    )
+    advanced_stack.addWidget(connection_group)
 
+    task_ids_edit = _line_edit("自动识别结果；仅排障时需要手动修改")
+    task_ids_edit.setAccessibleName("任务 ID 高级设置")
+    task_group, task_group_layout = _settings_group(
+        "任务识别",
+        "正常情况下由房间号自动识别。只有自动识别失败时，才需要手动填写任务 ID。",
+    )
+    task_group_layout.addWidget(task_ids_edit)
+    advanced_stack.addWidget(task_group)
+
+    notify_urls_edit = _line_edit(
+        "Telegram：tgram://BotToken/ChatID；也支持 Gotify、Server 酱、企业微信"
+    )
+    notify_urls_edit.setEchoMode(QLineEdit.Password)
+    notify_urls_edit.setAccessibleName("通知地址")
+    notify_urls_edit.setToolTip(
+        "Telegram 格式：tgram://BotToken/ChatID；多个通知地址用逗号分隔"
+    )
+    notify_reveal_btn = _button("显示", "gray", callbacks.toggle_notify_visibility)
+    notification_group, notification_layout = _settings_group(
+        "通知与运行行为",
+        "Telegram 使用 tgram://BotToken/ChatID；通知地址会隐藏并保存在受保护凭据中。",
+    )
+    notification_row = QHBoxLayout()
+    notification_row.setSpacing(8)
+    notification_row.addWidget(notify_urls_edit, 1)
+    notification_row.addWidget(notify_reveal_btn)
+    notification_row.addWidget(_button("测试通知", "gray", callbacks.test_notification))
+    notification_layout.addLayout(notification_row)
+
+    verbose_check = QCheckBox("输出详细运行日志")
+    disable_task_notify_check = QCheckBox("不发送任务完成通知")
+    option_row = QHBoxLayout()
+    option_row.setSpacing(20)
+    option_row.addWidget(verbose_check)
+    option_row.addWidget(disable_task_notify_check)
+    option_row.addStretch(1)
+    notification_layout.addLayout(option_row)
+    advanced_stack.addWidget(notification_group)
+
+    desktop_group, desktop_layout = _settings_group(
+        "桌面运行",
+        "默认最小化和关闭主窗口后继续驻留托盘；可在这里恢复普通窗口行为。",
+    )
+    minimize_to_tray_check = QCheckBox("最小化到托盘")
+    minimize_to_tray_check.setChecked(True)
+    close_to_tray_check = QCheckBox("关闭到托盘")
+    close_to_tray_check.setChecked(True)
+    desktop_options = QHBoxLayout()
+    desktop_options.setSpacing(20)
+    desktop_options.addWidget(minimize_to_tray_check)
+    desktop_options.addWidget(close_to_tray_check)
+    desktop_options.addStretch(1)
+    desktop_layout.addLayout(desktop_options)
+    advanced_stack.addWidget(desktop_group)
+
+    settings_actions = QHBoxLayout()
+    settings_actions.setSpacing(8)
+    settings_actions.addWidget(_button("导出诊断", "gray", callbacks.export_diagnostics))
+    settings_actions.addStretch(1)
+    settings_actions.addWidget(_button("加载设置", "gray", callbacks.load_config))
+    settings_actions.addWidget(_button("保存设置", "blue", callbacks.save_config))
+    advanced_stack.addLayout(settings_actions)
+    advanced_stack.addStretch(1)
+    settings_tabs.addTab(advanced_scroll, "高级设置")
+
+    log_page = QWidget()
+    log_layout = QVBoxLayout(log_page)
+    log_layout.setContentsMargins(14, 14, 14, 14)
+    log_layout.setSpacing(10)
+    log_head = QHBoxLayout()
+    log_title = QLabel("实时运行日志")
+    log_title.setFont(_font(11, bold=True))
+    log_head.addWidget(log_title)
+    log_head.addStretch(1)
+    log_head.addWidget(_button("清空", "gray", callbacks.clear_logs))
+    log_layout.addLayout(log_head)
     log_text = QPlainTextEdit()
     log_text.setReadOnly(True)
     log_text.setFont(QFont("Consolas", 10))
     log_text.setMaximumBlockCount(5000)
-    log_text.setMinimumHeight(160)
-    log_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-    log_text.setVisible(False)
-    log_layout.addWidget(log_text)
-
-    root_layout.addWidget(log_card)
+    log_text.setMinimumHeight(420)
+    log_layout.addWidget(log_text, 1)
+    settings_tabs.addTab(log_page, "运行日志")
 
     return MainWindowWidgets(
         cookie_edit=cookie_edit,
@@ -263,61 +514,155 @@ def build_main_window_layout(
         notify_urls_edit=notify_urls_edit,
         cookie_profile_combo=cookie_profile_combo,
         cookie_remark_edit=cookie_remark_edit,
-        threads_edit=threads_edit,
-        reconnect_edit=reconnect_edit,
-        task_interval_edit=task_interval_edit,
+        threads_spin=threads_spin,
+        reconnect_spin=reconnect_spin,
+        task_interval_spin=task_interval_spin,
         verbose_check=verbose_check,
         disable_task_notify_check=disable_task_notify_check,
         progress_bar=progress_bar,
-        task_text=task_text,
+        task_table=task_table,
         log_text=log_text,
-        log_card=log_card,
-        log_toggle_btn=log_toggle_btn,
+        settings_dialog=settings_dialog,
+        settings_tabs=settings_tabs,
+        settings_button=settings_button,
         claim_rewards_btn=claim_rewards_btn,
+        start_btn=start_btn,
+        enable_auto_btn=enable_auto_btn,
+        apply_all_switch=apply_all_switch,
+        auto_mining_description=auto_mining_description,
+        concurrency_mode_combo=concurrency_mode_combo,
+        minimize_to_tray_check=minimize_to_tray_check,
+        close_to_tray_check=close_to_tray_check,
+        discover_btn=discover_btn,
+        overwatch_esports_btn=overwatch_esports_btn,
+        cookie_reveal_btn=cookie_reveal_btn,
+        save_cookie_profile_btn=save_cookie_profile_btn,
+        delete_cookie_profile_btn=delete_cookie_profile_btn,
+        notify_reveal_btn=notify_reveal_btn,
+        runtime_state_label=runtime_state_label,
+        runtime_detail_label=runtime_detail_label,
+        discovery_status_label=discovery_status_label,
+        watch_time_label=watch_time_label,
     )
 
 
-def _make_line_edit(placeholder: str) -> QLineEdit:
+def _card(title: str) -> tuple[QFrame, QVBoxLayout]:
+    card = QFrame()
+    card.setObjectName("card")
+    card.setStyleSheet(CARD_STYLE)
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(18, 14, 18, 16)
+    layout.setSpacing(10)
+    if title:
+        label = QLabel(title)
+        label.setFont(_font(11, bold=True))
+        layout.addWidget(label)
+    return card, layout
+
+
+def _font(size: int, *, bold: bool = False) -> QFont:
+    font = QFont()
+    font.setPointSize(size)
+    font.setBold(bold)
+    return font
+
+
+def _line_edit(placeholder: str) -> QLineEdit:
     widget = QLineEdit()
     widget.setPlaceholderText(placeholder)
     return widget
 
 
-def _make_small_edit(default: str) -> QLineEdit:
-    widget = QLineEdit()
-    widget.setText(default)
-    widget.setMinimumWidth(70)
-    widget.setMaximumWidth(120)
-    widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-    return widget
+def _numeric_input(minimum: int, maximum: int, value: int) -> NumericLineEdit:
+    return NumericLineEdit(minimum, maximum, value)
 
 
-def _make_button(text: str, color: str, slot: Callable[..., None]) -> QPushButton:
+def _button(text: str, color: str, slot: Callable[..., None]) -> QPushButton:
     button = QPushButton(text)
-    button.setStyleSheet(BUTTON_STYLES.get(color, BUTTON_STYLES[""]))
+    button.setStyleSheet(
+        BUTTON_STYLES.get(color, BUTTON_STYLES[""]) + DISABLED_BUTTON_STYLE
+    )
     button.setCursor(Qt.PointingHandCursor)
-    button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
     button.clicked.connect(slot)
     return button
 
 
-def _build_labeled_row(
-    label: str,
-    editor: QLineEdit,
-    extra_button: tuple[str, str, Callable[..., None]] | None = None,
-) -> QHBoxLayout:
+def _buddy_label(text: str, buddy: QWidget) -> QLabel:
+    label = QLabel(text)
+    label.setBuddy(buddy)
+    label.setStyleSheet("color:#aeb6c5;")
+    label.setMinimumWidth(76)
+    return label
+
+
+def _form_row(label: str, primary: QWidget, *extras: QWidget) -> QHBoxLayout:
     row = QHBoxLayout()
     row.setSpacing(8)
-    lab = QLabel(label)
-    lab.setMinimumWidth(72)
-    lab.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
-    lab.setStyleSheet("color:#9aa0a6;")
-    row.addWidget(lab)
-    editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-    row.addWidget(editor, 1)
-    if extra_button is not None:
-        text, color, slot = extra_button
-        button = _make_button(text, color, slot)
-        button.setMinimumWidth(100)
-        row.addWidget(button)
+    row.addWidget(_buddy_label(label, primary))
+    primary.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+    row.addWidget(primary, 1)
+    for widget in extras:
+        row.addWidget(widget)
     return row
+
+
+def _settings_group(
+    title: str,
+    description: str,
+) -> tuple[QFrame, QVBoxLayout]:
+    group = QFrame()
+    group.setObjectName("settingsGroup")
+    group.setStyleSheet(
+        "QFrame#settingsGroup{background:#20242d;border:1px solid #323845;"
+        "border-radius:8px;}"
+    )
+    layout = QVBoxLayout(group)
+    layout.setContentsMargins(14, 12, 14, 14)
+    layout.setSpacing(8)
+    title_label = QLabel(title)
+    title_label.setFont(_font(10, bold=True))
+    layout.addWidget(title_label)
+    description_label = QLabel(description)
+    description_label.setWordWrap(True)
+    description_label.setStyleSheet("color:#9da7b8;")
+    layout.addWidget(description_label)
+    return group, layout
+
+
+def _field_widget(title: str, control: QWidget) -> QWidget:
+    field = QWidget()
+    layout = QVBoxLayout(field)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(5)
+    label = _buddy_label(title, control)
+    label.setMinimumWidth(0)
+    layout.addWidget(label)
+    control.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+    layout.addWidget(control)
+    return field
+
+
+def _runtime_action_group(
+    title: str,
+    primary: QPushButton,
+    secondary: QPushButton,
+) -> QWidget:
+    group = QFrame()
+    group.setObjectName("runtimeActionGroup")
+    group.setStyleSheet(
+        "QFrame#runtimeActionGroup{background:#20242d;border:1px solid #323845;"
+        "border-radius:8px;}"
+    )
+    layout = QVBoxLayout(group)
+    layout.setContentsMargins(10, 8, 10, 10)
+    layout.setSpacing(7)
+    label = QLabel(title)
+    label.setAlignment(Qt.AlignCenter)
+    label.setStyleSheet("color:#aeb6c5;font-size:9pt;")
+    layout.addWidget(label)
+    buttons = QHBoxLayout()
+    buttons.setSpacing(6)
+    buttons.addWidget(primary, 1)
+    buttons.addWidget(secondary, 1)
+    layout.addLayout(buttons)
+    return group

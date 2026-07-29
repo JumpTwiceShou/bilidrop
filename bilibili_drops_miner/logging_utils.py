@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 
 try:
@@ -27,6 +28,18 @@ LEVEL_LABEL = {
     logging.CRITICAL: "FATAL",
 }
 
+SENSITIVE_VALUE_RE = re.compile(
+    r"(?i)(SESSDATA|bili_jct|DedeUserID|csrf_token|csrf|access_token|corpsecret|token|secret|key)"
+    r"(\s*[:=]\s*)([^&;\s]+)"
+)
+
+
+def redact_sensitive_text(value: object) -> str:
+    return SENSITIVE_VALUE_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
+        str(value or ""),
+    )
+
 
 class PrettyFormatter(logging.Formatter):
     def __init__(self, *, verbose: bool, use_color: bool) -> None:
@@ -46,7 +59,7 @@ class PrettyFormatter(logging.Formatter):
         else:
             record.levelname = label
         try:
-            return super().format(record)
+            return redact_sensitive_text(super().format(record))
         finally:
             record.levelname = original_levelname
 

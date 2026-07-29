@@ -1,201 +1,259 @@
-# Bilibili 直播掉宝助手增强版
+# BiliDrop v2
 
-这是一个基于 [mi0e/BiliBiliDropsMiner](https://github.com/mi0e/BiliBiliDropsMiner) 的 B 站直播掉宝/观看时长任务挂机工具。
-本版本同步了上游最近版本的主要功能，并额外加入 GUI Cookie 档案管理，默认线程数调整为 128。
+BiliDrop 是基于 [mi0e/BiliBiliDropsMiner](https://github.com/mi0e/BiliBiliDropsMiner)
+维护的 B 站直播掉宝/观看时长工具。本分支的 v2 重构重点是：用户选择账号并输入
+房间号即可启动挂机；任务发现用于补充进度、通知和自动领奖。
 
-## 许可与来源
+> 仅供个人学习研究使用。请遵守平台规则；高并发可能触发限频或风控。
 
-- 原项目：<https://github.com/mi0e/BiliBiliDropsMiner>
-- 原项目说明：B 站直播掉宝助手，支持多线程加速
-- 本项目遵守 MIT License，已在 [LICENSE](LICENSE) 中保留原项目与本项目的版权声明。
-- 本项目仅供个人学习研究使用，不提供稳定性保证或技术支持。
+## v2 的主要变化
 
-## 本版本增强
+- 一个进程只运行一个 asyncio 后台，不再为每个会话创建系统线程和事件循环。
+- 每个账号只有一个任务监控器，不再按房间重复查询和发送完成通知。
+- 输入房间号后可通过直接网络请求发现任务；同时兼容当前 EVA 嵌套活动数据和旧版
+  `__initialState` 任务结构，无需房间正在直播。
+- 只有直接数据没有包含任务时，才启动完全隐藏的 Chrome/Edge 作为后台兜底。
+- 后台发现失败时，“识别当前任务”会自动启动原有的可见浏览器抓取流程兜底，
+  不再要求再次确认。
+- GUI 按“账号 → 直播与任务 → 运行”组织，任务进度使用结构化表格。
+- 账号选择器是独立工作区切换器；已保存和临时账号可以同时挂机，切换时分别显示各自
+  的房间、任务、进度和运行状态。
+- 高级设置和运行日志移到独立的“设置与日志”窗口，主页面专注账号、任务和运行状态。
+- 已完成任务由账号监控器自动尝试领取奖励；“手动领取”只用于失败重试。
+- 运行中锁定账号、房间和并发配置，避免跨线程修改 HTTP 客户端。
+- Windows 使用 DPAPI 加密已保存档案的 Cookie 和通知地址；未保存 Cookie 只存在内存中。
+- 默认每房间并发会话调整为 16，允许范围为 1–128。
+- 并发模式可选“自动”或“固定”，新账号默认自动。手动启动且没有可靠任务开始时间时，
+  自动模式先用 16 个会话，以 3 分钟为一轮：进度增加至少 16 时继续追赶，否则降到
+  2 个并保持到下一组新任务。后台自动检测到刚开始且初始进度为 0 的任务直接使用
+  2 个。运行区会显示当前/目标会话数、“自动追赶”或“自动稳定”阶段和判断依据。
+  升级时，旧版自动写入的默认固定模式会一次性迁移为自动；在新版明确选择并保存的
+  固定模式会继续保留。
+- Windows 只允许一个程序实例；重复启动会唤醒已经运行的窗口。最小化和关闭默认进入
+  系统托盘，可在高级设置关闭。
+- 主界面使用“开始/停止”和“后台自动挂机/停止后台自动”两颗状态按钮；右侧
+  “应用到所有账号”开关同时决定两颗按钮操作当前账号还是全部账号。
+- CLI 参数保持兼容。
 
-- GUI 支持将 Cookie 保存到 `cookies.json`。
-- GUI 支持在下拉框中切换多个 Cookie。
-- 每个 Cookie 档案支持自定义备注，未填写备注时会优先使用 `DedeUserID` 自动生成。
-- 默认线程数从 1 调整为 128，包括 GUI、CLI、配置默认值和示例配置。
-- 版本检查目标改为本仓库 release。
+架构说明见 [docs/architecture.md](docs/architecture.md)，旧版本迁移说明见
+[docs/migration-v2.md](docs/migration-v2.md)。
 
-`cookies.json` 保存位置：
+## 安装
 
-- 源码运行：当前工作目录。
-- 打包 exe 运行：exe 同目录。
-
-示例格式：
-
-```json
-{
-  "cookies": [
-    {
-      "remark": "主号",
-      "cookie": "SESSDATA=xxx; bili_jct=xxx; DedeUserID=123",
-      "updated_at": "2026-06-05 23:00:00"
-    }
-  ]
-}
-```
-
-## 已同步的上游更新
-
-对比上游最近几个版本，本版本已同步到上游 `v1.6.0`，包含以下能力：
-
-- `v1.4.3`：改进任务 ID 提取逻辑，支持 Nuitka 打包。
-- `v1.5.0`：新增一键领取全部掉宝奖励，改进 Chrome/Edge 跨平台检测，修复按日期分组的掉宝任务识别。
-- `v1.5.1`：修复自动获取浏览器优先级和任务进度误判。
-- `v1.5.2`：修复多标签检测，加入新版本检查。
-- `v1.6.0`：修复 Chrome 自动获取任务 ID 时新页面注入问题，重构 GUI 模块，改为通过 API 获取观看时长，优化任务进度结构化展示，并修复首次启动时 anyio 并发初始化异常。
-
-## 功能
-
-- 多房间并发挂机，支持每个房间多会话连接。
-- GUI 与 CLI 双模式。
-- 任务进度自动轮询与手动刷新。
-- 直播观看时长预估展示。
-- 一键领取掉宝奖励。
-- 自动获取 Cookie、房间号、任务 ID。
-- GUI 配置保存/加载。
-- Cookie 档案保存、备注和切换。
-- Gotify、Server 酱等通知地址支持。
-
-## 免责声明
-
-> 本项目仅供个人学习研究，不保证稳定性，不提供技术支持。
-> 使用本项目产生的一切后果由用户自行承担。
-> 禁止商业用途，请遵守版权及平台规则。
-
-## 参数获取
-
-### Cookie
-
-方式 1：GUI 中点击“自动获取”，在打开的 Chrome/Edge 浏览器中登录 B 站。
-方式 2：登录 B 站后打开浏览器开发者工具复制 Cookie。
-
-Cookie 必须至少包含：
-
-- `SESSDATA`
-- `bili_jct`
-
-建议同时保留：
-
-- `DedeUserID`
-- `DedeUserID__ckMd5`
-- `buvid3`
-
-### 房间号
-
-直播间 URL 中的数字部分就是房间号。
-例如 `https://live.bilibili.com/23612045` 的房间号为 `23612045`。
-
-### 任务 ID
-
-可在 GUI 中点击“自动获取任务 ID”。
-也可以从任务接口请求里提取 `task_ids` 参数：
-
-```text
-https://api.bilibili.com/x/task/totalv2?csrf=xxx&task_ids=taskId1,taskId2
-```
-多个任务 ID 使用英文逗号分隔。
-
-## 快速开始
-
-### Windows GUI
+建议使用独立虚拟环境：
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python bilibili_gui.py
 ```
 
-也可以直接运行 release 中的 exe。
-
-### CLI
+开发和测试额外安装：
 
 ```powershell
-python bilibili.py --cookie "SESSDATA=xxx; bili_jct=xxx" --rooms "23612045"
-```
-
-常用参数：
-
-```text
---cookie COOKIE                 B 站登录 Cookie
---rooms ROOMS                   房间号，多个用逗号分隔
---threads THREADS               每个房间会话数，默认 128
---reconnect-delay SECONDS       断线重连延迟
---task-ids TASK_IDS             用于进度监控的任务 ID
---task-interval SECONDS         任务查询间隔
---notify-urls URLS              通知 URL，多个用逗号分隔
---disable-task-notify           关闭任务完成通知
---no-color                      禁用彩色日志
--v, --verbose                   显示详细日志
-```
-
-示例：
-
-```powershell
-python bilibili.py `
-  --cookie "SESSDATA=xxx; bili_jct=xxx" `
-  --rooms "23612045,1017" `
-  --threads 128 `
-  --task-ids "taskId1,taskId2"
+python -m pip install -r requirements-dev.txt
+python -m pytest
 ```
 
 ## GUI 使用
 
-1. 填写或自动获取 Cookie。
-2. 填写直播间号。
-3. 可选：填写或自动获取任务 ID。
-4. 可选：填写通知 URL。
-5. 按需调整线程数、重连延迟和任务查询间隔。
-6. 点击“启动”。
+```powershell
+python bilibili_gui.py
+```
 
-Cookie 档案：
+正常流程：
 
-1. 在 Cookie 输入框填入 Cookie。
-2. 在“备注”中填写账号备注。
-3. 点击“保存Cookie”写入 `cookies.json`。
-4. 之后可从“Cookie档案”下拉框切换账号。
-5. 选择档案后点击“删除Cookie”可删除该档案。
+1. 点击“扫码登录”，使用手机 Bilibili App 扫描应用内二维码；不会打开浏览器。
+2. 登录成功后先创建临时账号，并询问是否保存为账号档案；只有选择保存后 Cookie 才进入
+   Windows 加密凭据存储。已填写备注时使用备注，否则使用 Cookie 中的 UID。
+3. 输入直播房间号或直播间 URL；守望先锋赛事可直接点击“守望先锋电竞”。
+4. 如需查看任务进度和自动领奖，点击“识别当前任务”。程序先直接请求房间活动数据，
+   只在必要时启动无界面浏览器兜底。
+5. 如果检测到唯一或当前激活任务组，程序自动采用当天任务组里的全部任务 ID；无法判断
+   任务组时显示选择框。
+6. 点击“开始挂机”。只要 Cookie 和房间号有效就会直接启动，任务识别失败或尚未识别
+   都不会阻止观看心跳。
+7. 已识别任务时，任务表格会同时列出当天全部任务，以及 60/120/180/240 分钟等每个
+   奖励节点。任一节点完成后都会独立自动领取，失败时可点击“手动领取”兜底。未识别
+   任务时只运行挂机，不查询进度或领奖。
+8. 点击“停止”，等待连接正常退出。
 
-## 配置文件
+“应用到所有账号”关闭时，两颗运行按钮只控制当前选择的账号；开启时，两颗按钮同时控制
+所有账号。按钮会在启动后原位变成“停止”或“停止后台自动”。后台自动挂机会解析任务组
+的开始/结束时间：当前任务每 15 分钟检查一次，提前发现的未来任务每 60 分钟检查一次并
+在开始时间准时唤醒；任务已开始且直播开播时自动启动心跳，当天所有奖励节点完成并确认
+最后一次领奖后停止心跳，但继续轮询下一场任务。先开启后台自动挂机、之后再填写房间号或
+识别任务时，会立即检查，无需等待下一次定时轮询。
+点击“停止后台自动”会停止轮询，并停止由后台自动功能启动的挂机；用户手动点击“开始”
+启动的挂机不会被误停。后台自动挂机只在当前运行中有效，每次重新打开程序后默认关闭，
+必须由用户再次点击按钮开启；保存普通设置不会把它变成启动项。
 
-GUI 支持保存/加载 JSON 配置文件，示例见 [config.example.json](config.example.json)。
+需要同时挂机多个账号时，再次点击“扫码登录”即可。扫码得到的新账号会自动创建为临时
+工作区，不会覆盖原来已保存、临时或正在挂机的账号。账号选择器会显示 UID、`已保存`/
+`临时·关闭即删` 和 `挂机中` 等状态；切换账号不会停止其他账号。临时账号不会写入磁盘，
+关闭程序后自动删除。
+
+账号选择器会在启动后显示 `登录检测中`、`登录有效`、`登录失效` 或 `登录检测失败`。
+已保存档案确认失效后不能开始挂机，需重新扫码。扫码登录到已存在的同 UID 档案时会更新
+该档案的 Cookie 并保留原备注，不会创建重复档案；正在挂机的同 UID 档案不会被替换。
+
+点击窗口顶部状态徽标左侧的“设置与日志”，可在独立窗口切换高级设置和实时日志。
+通知地址、手动任务 ID、并发会话数、重连延迟和查询间隔位于高级设置中。三个数字
+参数为纯数字输入框，没有加减按钮，也不会响应鼠标滚轮改值。
+
+## 后台任务发现
+
+发现顺序：
+
+1. 使用短时缓存和当前账号 Cookie，直接请求房间活动数据。
+2. 依次解析当前 `window.__BILIACT_EVAPAGEDATA__` 嵌套组件树和旧版
+   `window.__initialState` 任务结构；直播状态不是读取任务的前置条件。
+3. 直接数据没有任务时，启动不创建窗口的 `--headless=new` Chrome/Edge 后台兜底；
+   优先使用用户最近选择的浏览器，并把总等待时间分配给两个浏览器。
+4. 当前激活任务组自动选中；多个不明确任务组由用户确认。
+5. 所有后台方式都失败后，才询问是否由用户主动打开可见浏览器继续；旧版
+   `/x/task/totalv2` 网络响应捕获仍作为这个流程的兼容兜底。
+
+如果直接页面没有任务且房间明确未开播，识别会快速结束并提示“仍可直接开始挂机”，
+不会把“没有识别到任务”误当成运行失败。
+
+识别进行中时，主按钮会切换为“取消识别”，可立即请求停止后台发现。
+
+后台错误只显示“页面渲染超时、无法创建会话”等摘要，不再输出 WebDriver 调用栈。
+
+任务查询返回错误时，每次运行最多自动触发一次强制重新发现，避免旧任务 ID 持续失败。
+
+识别成功会立即查询并填充结构化任务表，无需再点“手动刷新”。Bilibili 当前可能把当天
+全部观看奖励放在一个外层任务系列中；例如接口返回 1 个外层任务、5 个奖励节点时，界面
+会显示 5 行节点，而不是把它们压成一行文字。
+
+程序按 `/x/task/totalv2` 的节点状态显示领奖结果：`status=2` 是已达标待领取，
+`status=3` 是已领取（同时兼容旧缓存中的 `6`）。领奖使用每个奖励节点自己的 `sid`，
+不会把外层任务 ID 重复提交；失败后按 1/5/15/60 分钟冷却退避，不再每次刷新连续轰炸接口。
+
+## 凭据与配置
+
+“保存设置”和“加载设置”不再弹出文件选择框。程序设置、账号备注、最近选择状态、
+DPAPI 加密 Cookie 和加密通知地址都由程序统一保存在：
+
+```text
+%LOCALAPPDATA%\BiliDrop\credentials.json
+```
+
+扫码登录使用 Bilibili 官方二维码生成和状态轮询接口。二维码状态查询在后台执行，成功
+响应中的 Cookie 不会写入日志。只有已保存档案的 Cookie 才进入 Windows 加密凭据。
+
+Cookie、通知地址和保存的设置正文经过当前 Windows 用户的 DPAPI 保护，不能直接复制到
+其他用户或设备使用；账号备注等索引元数据与它们位于同一个文件中。Cookie 输入框和通知
+地址默认遮蔽，脱敏诊断不包含这些值。旧外部设置格式见
+[config.example.json](config.example.json)，读取代码仍保留兼容。
+
+程序不再保存“上次使用但未保存”的 Cookie，并会删除旧版本遗留的 `last-cookie`。启动时
+只加载已保存档案，并默认选择最近使用的已保存档案；没有已保存档案时创建一个空白临时
+账号。临时账号可以创建多个，但只在本次程序运行期间存在。
+
+旧 `cookies.json` 首次加载时会先把 Cookie 加密写入统一文件，并把账号备注、更新时间和
+最近选择状态一并写入后回读校验。只有校验完全通过，旧文件才会移动到
+`%LOCALAPPDATA%\BiliDrop\legacy\`；失败时原文件保持不动。程序目录因此不再创建或保留
+任何配套 JSON。
+
+单文件升级时，把新 EXE 放到旧 EXE 所在目录即可；程序会迁移同目录旧版 `cookies.json`
+的列表或 `{ "cookies": [...] }` 格式，不需要重新扫码。若把新 EXE 移到其他目录，需要
+同时带上旧 `cookies.json` 完成首次迁移，程序不会扫描其他磁盘位置。
+
+旧配置文件仍可读取；其中的 Cookie 会作为临时账号加载而不会自动保存，通知地址会迁移到
+受保护存储。新保存的普通配置不会写出秘密。
+
+## CLI
+
+```powershell
+python bilibili.py `
+  --cookie "SESSDATA=xxx; bili_jct=xxx" `
+  --rooms "23612045" `
+  --threads 16 `
+  --task-ids "taskId1,taskId2"
+```
+
+主要参数：
+
+```text
+--cookie COOKIE                 B 站登录 Cookie
+--rooms ROOMS                   房间号、直播间 URL，多个用逗号分隔
+--threads THREADS               每房间异步会话数，默认 16，范围 1–128
+--reconnect-delay SECONDS       重连延迟，范围 5–3600 秒
+--task-ids TASK_IDS             可选任务 ID；GUI 正常流程无需手动填写
+--task-interval SECONDS         账号级任务查询间隔，范围 10–3600 秒
+--notify-urls URLS              通知地址，多个用逗号或换行分隔
+--disable-task-notify           关闭任务完成通知
+-v, --verbose                   详细日志
+```
+
+命令行参数可能出现在终端历史记录中。长期使用时请通过受保护的本地启动方式提供 Cookie，
+不要把真实 Cookie 写入仓库、脚本或示例文件。
+
+## 运行状态与诊断
+
+GUI 显示：
+
+- 当前状态：未运行、识别中、启动中、运行中、停止中或异常。
+- 活跃/目标连接数。
+- 重连次数和最近成功心跳。
+- 账号级任务刷新结果。
+
+“导出诊断”仅包含版本、房间号、连接计数、时间、任务数量和已脱敏错误，不包含 Cookie、
+通知地址、浏览器数据或令牌。
+
+## 通知与奖励
+
+- 原生支持 Telegram Bot、Gotify、Server 酱和企业微信；源码环境仍可使用 Apprise 回退渠道。
+- Telegram 地址格式为 `tgram://BotToken/ChatID`；多个地址用逗号分隔，地址会保存在受保护凭据中。
+- “测试通知”只发送固定测试文字，不记录通知 URL。
+- 完成通知由账号级任务监控器去重，并包含 Bilibili 用户名/UID、当前直播间、任务名称/ID、完成进度和领奖结果。
+- 领取操作串行执行；已领取或不可领取的任务由接口状态跳过。
+- 任务完成后会自动领奖；失败会在后续刷新中重试，“手动领取”用于兜底。
 
 ## 打包
 
-PyInstaller：
+默认构建单文件 GUI（输出 `dist/bilibili-drops-miner-gui.exe`）：
+
+```powershell
+python -m pip install -r requirements-build.txt
+python build.py --target gui --clean
+```
+
+需要保留正在运行的旧文件时，可为新构建追加输出后缀：
+
+```powershell
+python build.py --target gui --clean --name-suffix unattended
+```
+
+`--release` 仍作为兼容参数保留，同样生成单文件：
 
 ```powershell
 python build.py --release --target gui --clean
-python build.py --target cli --clean
 ```
 
-`--release` 会输出单个可直接运行的 exe；默认不带 `--release` 时输出开发用文件夹。
+只有本地开发排障需要展开目录时，才使用 `--onedir`。
 
-Nuitka：
+也可使用 Nuitka：
 
 ```powershell
 python -m pip install nuitka
 python build_nuitka.py --target gui
 ```
 
-## 常见问题
-
-### 任务时长为什么一直为 0？
-
-任务时长通常不是实时结算。启动后至少等待 30 秒再观察。若长时间为 0，可能是账号风控或直播任务未被平台认可。
-
-### 线程数越高越好吗？
-
-不是。线程数过高可能触发平台风控。当前默认值是 128，适合追求高并发的场景；如果出现异常，建议降低到 60 到 80 后重试。
-
-### 自动获取打不开浏览器怎么办？
-
-自动获取依赖 Chrome/Edge 和 Selenium。请确认浏览器安装在常见路径，首次运行时 Selenium Manager 可能会下载驱动。
-
-## 开发验证
+## 聚焦验证
 
 ```powershell
-python -m compileall bilibili_drops_miner bilibili.py bilibili_gui.py build.py build_nuitka.py
+python -m pytest
 python bilibili.py --help
+python -m compileall bilibili_drops_miner bilibili.py bilibili_gui.py build.py build_nuitka.py
 ```
+
+真实账号、通知渠道和领奖属于外部状态操作，不包含在无凭据自动化测试中。
+
+## 许可与来源
+
+- 上游：<https://github.com/mi0e/BiliBiliDropsMiner>
+- 许可：MIT，详见 [LICENSE](LICENSE)。
+- 本仓库不保证平台接口长期稳定，也不提供规避平台限制的能力。

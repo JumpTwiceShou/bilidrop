@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import dataclass
 
 from bilibili_drops_miner.client import LiveWatchTime
 
@@ -43,6 +44,89 @@ def format_live_watch_time_progress(
 
 BAR_WIDTH = 20
 DURATION_TASK_RE = re.compile(r"^(.+?)\d+分钟$")
+
+
+@dataclass(frozen=True, slots=True)
+class TaskProgressTableRow:
+    task_id: str
+    progress_id: str
+    label: str
+    cur_value: int | float
+    limit_value: int | float
+    status: int
+    is_completed: bool
+    reward_name: str = ""
+    reward_count: int | float = 0
+
+    @property
+    def is_claimed(self) -> bool:
+        return self.status in (3, 6)
+
+    @property
+    def is_claimable(self) -> bool:
+        return self.status == 2
+
+    @property
+    def reward_text(self) -> str:
+        if not self.reward_name:
+            return "—"
+        try:
+            has_count = float(self.reward_count) > 0
+        except (TypeError, ValueError):
+            has_count = False
+        if has_count:
+            return f"{self.reward_name} × {_format_task_number(self.reward_count)}"
+        return self.reward_name
+
+
+def task_progress_table_rows(progresses: list) -> list[TaskProgressTableRow]:
+    """Flatten every outer task/checkpoint into independently visible reward rows."""
+
+    rows: list[TaskProgressTableRow] = []
+    for task in progresses:
+        task_id = str(getattr(task, "task_id", "") or "").strip()
+        task_label = str(
+            getattr(task, "task_name", "") or task_id or "未命名任务"
+        ).strip()
+        check_points = list(getattr(task, "check_points", []) or [])
+        if not check_points:
+            rows.append(
+                TaskProgressTableRow(
+                    task_id=task_id,
+                    progress_id=task_id,
+                    label=task_label,
+                    cur_value=getattr(task, "cur_value", 0),
+                    limit_value=getattr(task, "limit_value", 0),
+                    status=int(getattr(task, "status", 0) or 0),
+                    is_completed=bool(getattr(task, "is_completed", False)),
+                )
+            )
+            continue
+
+        for index, point in enumerate(check_points, start=1):
+            point_id = str(getattr(point, "sid", "") or "").strip()
+            point_label = str(
+                getattr(point, "alias", "") or point_id or f"奖励节点 {index}"
+            ).strip()
+            label = (
+                task_label
+                if point_label == task_label
+                else f"{task_label} · {point_label}"
+            )
+            rows.append(
+                TaskProgressTableRow(
+                    task_id=task_id,
+                    progress_id=point_id or f"{task_id}:checkpoint:{index}",
+                    label=label,
+                    cur_value=getattr(point, "cur_value", 0),
+                    limit_value=getattr(point, "limit_value", 0),
+                    status=int(getattr(point, "status", 0) or 0),
+                    is_completed=bool(getattr(point, "is_completed", False)),
+                    reward_name=str(getattr(point, "award_name", "") or "").strip(),
+                    reward_count=getattr(point, "award_count", 0),
+                )
+            )
+    return rows
 
 
 def _display_width(text: str) -> int:

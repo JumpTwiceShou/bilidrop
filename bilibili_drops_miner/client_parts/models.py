@@ -52,6 +52,16 @@ class TaskCheckpointProgress:
     award_count: int | float = 0
 
     @property
+    def is_claimable(self) -> bool:
+        """`totalv2` status 2 means the checkpoint is ready to claim."""
+        return self.status == 2
+
+    @property
+    def is_claimed(self) -> bool:
+        """`totalv2` uses 3 for claimed; keep 6 for older cached data."""
+        return self.status in (3, 6)
+
+    @property
     def is_completed(self) -> bool:
         try:
             limit = float(self.limit_value)
@@ -60,7 +70,7 @@ class TaskCheckpointProgress:
                 return cur >= limit
         except (TypeError, ValueError):
             pass
-        return self.status in (3, 6)
+        return self.is_claimable or self.is_claimed
 
 
 @dataclass(slots=True)
@@ -79,6 +89,14 @@ class TaskProgress:
     is_need_polling: int = 0
 
     @property
+    def is_claimable(self) -> bool:
+        return self.status == 2
+
+    @property
+    def is_claimed(self) -> bool:
+        return self.status in (3, 6)
+
+    @property
     def is_completed(self) -> bool:
         try:
             limit = float(self.limit_value)
@@ -88,7 +106,7 @@ class TaskProgress:
         except (TypeError, ValueError):
             pass
         # 无可用进度指标时，仅信任明确的终态（已领取等）。
-        return self.status in (3, 6)
+        return self.is_claimable or self.is_claimed
 
 
 @dataclass(slots=True)
