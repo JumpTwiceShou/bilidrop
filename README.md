@@ -3,6 +3,8 @@
 BiliDrop 是面向 Windows 的 Bilibili 直播掉宝助手。登录账号并填写直播间后，它可以发送
 观看心跳、识别当天任务、展示每个奖励节点的进度，并在达标后自动领取奖励。
 
+> **下载最新版：** [前往 GitHub Releases 下载 BiliDrop](https://github.com/JumpTwiceShou/bilidrop/releases/latest)
+
 > 仅供个人学习研究使用。请遵守平台规则；过高并发可能触发限频或风控。
 
 [v2.0.0 更新说明](docs/release-notes-v2.0.0.md) ·
