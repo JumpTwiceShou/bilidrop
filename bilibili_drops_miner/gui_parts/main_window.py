@@ -2271,15 +2271,37 @@ class MinerGUI(QMainWindow):
         return session
 
     def _apply_auto_task_ids(self, task_ids_str: str) -> None:
-        self.task_ids_edit.setText(task_ids_str)
-        session = self._active_session
-        session.task_ids_text = task_ids_str
+        task_ids = parse_task_ids(task_ids_str)
+        normalized = ",".join(task_ids)
+        sessions = self._scope_sessions()
+        self.task_ids_edit.setText(normalized)
+        for session in sessions:
+            tasks_changed = parse_task_ids(session.task_ids_text) != task_ids
+            session.task_ids_text = normalized
+            session.pending_start_after_discovery = False
+            session.rediscovery_attempted_for_run = False
+            if tasks_changed:
+                session.latest_task_snapshot = TaskSnapshot()
+                session.task_progress_result = ""
+                session.task_progress_pending = False
+            if session.session_id != self._active_session_id:
+                session.discovery_status_text = (
+                    f"已从当前账号同步 {len(task_ids)} 个当天任务，"
+                    "正在刷新本账号进度"
+                )
+                session.discovery_status_error = False
+            if session.controller.is_running:
+                session.controller.update_task_ids(task_ids)
+        if self._active_session.latest_task_snapshot != self._latest_task_snapshot:
+            self._render_task_snapshot(self._active_session.latest_task_snapshot)
         self._on_runtime_inputs_changed()
-        if self.worker_controller.is_running:
-            self.worker_controller.update_task_ids(parse_task_ids(task_ids_str))
-        self.task_controller.refresh(manual=False)
+        for session in sessions:
+            session.task_controller.refresh(manual=False)
         self._pending_start_after_discovery = False
-        session.pending_start_after_discovery = False
+        logging.getLogger(__name__).info(
+            "任务识别结果已应用到%s并分别刷新进度",
+            "所有账号" if self.apply_all_switch.isChecked() else "当前账号",
+        )
 
     def _apply_selected_task_group(
         self,

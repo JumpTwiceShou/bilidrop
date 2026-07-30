@@ -317,7 +317,8 @@ def build_main_window_layout(
     apply_all_switch = ToggleSwitch()
     apply_all_switch.setAccessibleName("应用到所有账号")
     apply_all_switch.setToolTip(
-        "开启后，“开始/停止”和“后台自动挂机”都会操作所有账号"
+        "开启后，识别任务、“开始/停止”和“后台自动挂机”都会应用到所有账号；"
+        "每个账号仍独立查询自己的进度"
     )
     scope_label.setBuddy(apply_all_switch)
     action_row.addWidget(scope_label)

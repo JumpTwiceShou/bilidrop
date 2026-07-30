@@ -524,6 +524,92 @@ def test_recognized_task_ids_trigger_immediate_structured_refresh(
     assert refreshes == [False]
 
 
+def test_recognized_tasks_only_update_current_account_when_scope_is_off(
+    window,
+    monkeypatch,
+) -> None:
+    first = window._active_session
+    first.task_ids_text = "first-old"
+    window._restore_active_session()
+    window.new_temporary_account()
+    second = window._active_session
+    second.task_ids_text = "second-old"
+    window._restore_active_session()
+    refreshes: list[str] = []
+    monkeypatch.setattr(
+        first.task_controller,
+        "refresh",
+        lambda *, manual: refreshes.append(first.session_id),
+    )
+    monkeypatch.setattr(
+        second.task_controller,
+        "refresh",
+        lambda *, manual: refreshes.append(second.session_id),
+    )
+    window.apply_all_switch.setChecked(False)
+
+    window._apply_auto_task_ids("daily-a,daily-b")
+
+    assert first.task_ids_text == "first-old"
+    assert second.task_ids_text == "daily-a,daily-b"
+    assert refreshes == [second.session_id]
+
+
+def test_recognized_tasks_sync_all_accounts_and_refresh_independently(
+    window,
+    monkeypatch,
+) -> None:
+    first = window._active_session
+    first.cookie = "DedeUserID=10001; SESSDATA=one"
+    first.controller = _FakeWorkerController()
+    first_snapshot = TaskSnapshot(
+        progresses=(TaskProgress("first-old", "账号一旧进度", 0, 1, 10),)
+    )
+    first.latest_task_snapshot = first_snapshot
+    first.task_ids_text = "first-old"
+    window._restore_active_session()
+    window.new_temporary_account()
+    first.controller.is_running = True
+    second = window._active_session
+    second.cookie = "DedeUserID=10002; SESSDATA=two"
+    second.controller = _FakeWorkerController()
+    second_snapshot = TaskSnapshot(
+        progresses=(TaskProgress("second-old", "账号二旧进度", 0, 2, 10),)
+    )
+    second.latest_task_snapshot = second_snapshot
+    window._restore_active_session()
+    refreshes: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        first.task_controller,
+        "refresh",
+        lambda *, manual: refreshes.append((first.session_id, manual)),
+    )
+    monkeypatch.setattr(
+        second.task_controller,
+        "refresh",
+        lambda *, manual: refreshes.append((second.session_id, manual)),
+    )
+    window.apply_all_switch.setChecked(True)
+
+    window._apply_auto_task_ids("daily-a,daily-b")
+
+    assert first.task_ids_text == "daily-a,daily-b"
+    assert second.task_ids_text == "daily-a,daily-b"
+    assert window.task_ids_edit.text() == "daily-a,daily-b"
+    assert first.controller.task_id_updates == [["daily-a", "daily-b"]]
+    assert second.controller.task_id_updates == []
+    assert refreshes == [
+        (first.session_id, False),
+        (second.session_id, False),
+    ]
+    assert first.latest_task_snapshot is not first_snapshot
+    assert second.latest_task_snapshot is not second_snapshot
+    assert not first.latest_task_snapshot.progresses
+    assert not second.latest_task_snapshot.progresses
+    assert first.controller.starts == 0
+    assert second.controller.starts == 0
+
+
 def test_discovery_button_becomes_cancel_action(window, monkeypatch) -> None:
     cancelled: list[bool] = []
     monkeypatch.setattr(
@@ -661,6 +747,7 @@ class _FakeWorkerController:
         self.configs = []
         self.stop_requests = 0
         self.on_health = None
+        self.task_id_updates = []
 
     def start(self, _config, *, logger, on_health, on_task_snapshot) -> bool:
         self.starts += 1
@@ -679,6 +766,7 @@ class _FakeWorkerController:
         return "stopped"
 
     def update_task_ids(self, _task_ids):
+        self.task_id_updates.append(list(_task_ids))
         return True
 
 
