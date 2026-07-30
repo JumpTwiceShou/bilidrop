@@ -58,11 +58,22 @@ def select_scheduled_task_group(
             min(60 * 60, seconds_to_start),
         )
 
-    active = [group for group in groups if group.active]
+    # When every dated group has ended, the page's visual "active" flag may
+    # still point at yesterday.  Never let that stale tab drive heartbeats,
+    # progress, claims, or adaptive concurrency.
+    unscheduled = tuple(
+        group
+        for group in groups
+        if group.start_at is None or group.end_at is None
+    )
+    if scheduled and not unscheduled:
+        return ScheduledTaskSelection(None, "expired", 15 * 60)
+
+    active = [group for group in unscheduled if group.active]
     if len(active) == 1:
         return ScheduledTaskSelection(active[0], "current", 15 * 60)
-    if len(groups) == 1:
-        return ScheduledTaskSelection(groups[0], "current", 15 * 60)
+    if len(unscheduled) == 1:
+        return ScheduledTaskSelection(unscheduled[0], "current", 15 * 60)
     return ScheduledTaskSelection(None, "none", 15 * 60)
 
 

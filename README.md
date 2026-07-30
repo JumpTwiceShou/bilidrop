@@ -1,9 +1,12 @@
-# BiliDrop v2.0.0
+# BiliDrop v2.0.1
 
 BiliDrop 是面向 Windows 的 Bilibili 直播掉宝助手。登录账号并填写直播间后，它可以发送
 观看心跳、识别当天任务、展示每个奖励节点的进度，并在达标后自动领取奖励。
 
 > **下载最新版：** [前往 GitHub Releases 下载 BiliDrop](https://github.com/JumpTwiceShou/bilidrop/releases/latest)
+
+> **v2.0.1 紧急修复：** 已适配 Bilibili 最新任务页格式，恢复当天任务、当前进度和
+> 任务有效时间识别；同时修复可见浏览器兜底提前关闭的问题，并增加可关闭的启动更新检查。
 
 ## 使用方法
 
@@ -47,6 +50,7 @@ BiliDrop 是面向 Windows 的 Bilibili 直播掉宝助手。登录账号并填�
 
 > 仅供个人学习研究使用。请遵守平台规则；过高并发可能触发限频或风控。
 
+[v2.0.1 更新说明](docs/release-notes-v2.0.1.md) ·
 [v2.0.0 更新说明](docs/release-notes-v2.0.0.md) ·
 [旧版本升级指南](docs/migration-v2.md) ·
 [架构说明](docs/architecture.md)
@@ -233,6 +237,7 @@ python build.py --target gui --clean --name-suffix unattended
 
 ## 项目文档
 
+- [v2.0.1 紧急更新说明](docs/release-notes-v2.0.1.md)
 - [v2.0.0 完整更新说明](docs/release-notes-v2.0.0.md)
 - [v2 架构与线程模型](docs/architecture.md)
 - [旧版 Cookie 和配置迁移](docs/migration-v2.md)

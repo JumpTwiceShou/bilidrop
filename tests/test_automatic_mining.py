@@ -73,6 +73,24 @@ def test_future_group_polls_hourly_but_wakes_at_start() -> None:
     assert near.next_check_seconds == 5 * 60
 
 
+def test_expired_active_group_never_drives_automatic_mining() -> None:
+    expired = DiscoveredTaskGroup(
+        "yesterday",
+        ("old-task",),
+        active=True,
+        start_at=datetime(2026, 7, 29, 17, 30, tzinfo=SHANGHAI),
+        end_at=datetime(2026, 7, 30, 17, 0, tzinfo=SHANGHAI),
+    )
+
+    selected = select_scheduled_task_group(
+        (expired,),
+        now=datetime(2026, 7, 30, 17, 15, tzinfo=SHANGHAI),
+    )
+
+    assert selected.group is None
+    assert selected.phase == "expired"
+
+
 def test_all_reward_nodes_must_be_complete_before_stopping_heartbeats() -> None:
     task = TaskProgress(
         "daily",

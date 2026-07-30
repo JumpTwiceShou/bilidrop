@@ -1,4 +1,6 @@
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -10,6 +12,10 @@ from PySide6.QtWidgets import QApplication, QLineEdit, QPushButton, QSpinBox
 from bilibili_drops_miner.client_parts.models import (
     TaskCheckpointProgress,
     TaskProgress,
+)
+from bilibili_drops_miner.automatic_mining import (
+    AutomaticAccountCheckResult,
+    ScheduledTaskSelection,
 )
 from bilibili_drops_miner.credential_store import MemoryCredentialStore
 from bilibili_drops_miner.domain import ApplicationState, RuntimeHealth, TaskSnapshot
@@ -85,6 +91,8 @@ def test_initial_gui_is_guided_and_secrets_are_masked(window, app) -> None:
     assert window.settings_button.text() == "设置与日志"
     assert window.threads_spin.value() == 16
     assert window.concurrency_mode_combo.currentData() == "automatic"
+    assert window.auto_check_updates_check.isChecked()
+    assert "不自动下载" in window.auto_check_updates_check.toolTip()
     assert "Telegram" in window.notify_urls_edit.placeholderText()
     assert "tgram://BotToken/ChatID" in window.notify_urls_edit.placeholderText()
     assert window.claim_rewards_btn.text() == "手动领取"
@@ -232,6 +240,22 @@ def test_settings_button_opens_dedicated_window(window, app) -> None:
     window.settings_dialog.close()
 
 
+def test_disabled_update_check_does_not_contact_release_api(
+    window,
+    monkeypatch,
+) -> None:
+    window.auto_check_updates_check.setChecked(False)
+    monkeypatch.setattr(
+        main_window_module,
+        "check_latest_release",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("关闭更新检查后不得请求 Release API")
+        ),
+    )
+
+    window._check_update_silent()
+
+
 def test_background_automatic_mining_controls_are_mutually_exclusive(
     window,
 ) -> None:
@@ -287,6 +311,7 @@ def test_settings_save_and_load_use_combined_store_without_file_picker(
     window.rooms_edit.setText("23612045")
     window.threads_spin.setValue(32)
     window.task_ids_edit.setText("daily-a,daily-b")
+    window.auto_check_updates_check.setChecked(False)
     window._automatic_mining_session_ids.add(window._active_session_id)
 
     window.save_config()
@@ -294,12 +319,15 @@ def test_settings_save_and_load_use_combined_store_without_file_picker(
         window._credential_store
     )
     assert saved["automatic_mining_enabled"] is False
+    assert saved["auto_check_updates"] is False
     window.rooms_edit.clear()
     window.task_ids_edit.clear()
+    window.auto_check_updates_check.setChecked(True)
     window.load_config()
 
     assert window.rooms_edit.text() == "23612045"
     assert window.task_ids_edit.text() == "daily-a,daily-b"
+    assert not window.auto_check_updates_check.isChecked()
 
 
 def test_runtime_table_shows_each_reward_checkpoint(window) -> None:
@@ -962,3 +990,50 @@ def test_runtime_input_change_immediately_wakes_enabled_background_auto(
     assert session.rooms_text == "23612045"
     assert session.task_ids_text == "task-a"
     assert session.next_automatic_check_at == 0.0
+
+
+def test_expired_automatic_task_clears_stale_progress_and_stops_auto_runtime(
+    window,
+    monkeypatch,
+) -> None:
+    session = window._active_session
+    session.controller = _FakeWorkerController()
+    session.controller.is_running = True
+    session.auto_started_runtime = True
+    session.task_ids_text = "old-task"
+    session.task_started_at = datetime(
+        2026, 7, 29, 17, 30, tzinfo=ZoneInfo("Asia/Shanghai")
+    )
+    session.task_ends_at = datetime(
+        2026, 7, 30, 17, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+    )
+    session.latest_task_snapshot = TaskSnapshot(
+        progresses=(TaskProgress("old-task", "昨日任务", 3, 300, 300),)
+    )
+    window._automatic_mining_session_ids.add(session.session_id)
+    stopped: list[str] = []
+
+    def stop_account(target) -> None:
+        stopped.append(target.session_id)
+        target.controller.is_running = False
+
+    monkeypatch.setattr(window, "_stop_account_session", stop_account)
+
+    window._apply_automatic_account_check(
+        AutomaticAccountCheckResult(
+            session_id=session.session_id,
+            selection=ScheduledTaskSelection(
+                None,
+                "expired",
+                15 * 60,
+            ),
+            error="仅发现已结束任务",
+        )
+    )
+
+    assert stopped == [session.session_id]
+    assert session.task_ids_text == ""
+    assert session.task_started_at is None
+    assert session.task_ends_at is None
+    assert not session.latest_task_snapshot.progresses
+    assert "旧任务已结束" in session.discovery_status_text

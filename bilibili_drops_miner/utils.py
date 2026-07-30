@@ -7,6 +7,8 @@ from datetime import datetime
 from urllib.parse import unquote
 from zoneinfo import ZoneInfo
 
+import json5
+
 COOKIE_PATTERN = re.compile(r"\s*([^=;\s]+)\s*=\s*([^;]*)")
 ACTIVITY_WINDOW_PATTERN = re.compile(
     r"(\d{4})年(\d{1,2})月(\d{1,2})日\s*"
@@ -75,6 +77,84 @@ def parse_notification_urls(raw: str) -> list[str]:
     return _dedupe_preserving_order(values)
 
 
+def _is_javascript_identifier_char(char: str) -> bool:
+    return char.isalnum() or char in "_$"
+
+
+def _normalize_javascript_literals(raw: str) -> str:
+    """Convert the small set of minifier literals unsupported by JSON5.
+
+    The replacement is lexical and never touches quoted strings.  Embedded
+    activity state is data, so deliberately do not execute it with ``eval``.
+    """
+    normalized: list[str] = []
+    index = 0
+    quote = ""
+    escaped = False
+    while index < len(raw):
+        char = raw[index]
+        if quote:
+            normalized.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            index += 1
+            continue
+
+        if char in {'"', "'"}:
+            quote = char
+            normalized.append(char)
+            index += 1
+            continue
+
+        if raw.startswith("!0", index):
+            next_index = index + 2
+            if (
+                next_index >= len(raw)
+                or not _is_javascript_identifier_char(raw[next_index])
+            ):
+                normalized.append("true")
+                index = next_index
+                continue
+        if raw.startswith("!1", index):
+            next_index = index + 2
+            if (
+                next_index >= len(raw)
+                or not _is_javascript_identifier_char(raw[next_index])
+            ):
+                normalized.append("false")
+                index = next_index
+                continue
+        if raw.startswith("undefined", index):
+            previous = raw[index - 1] if index else ""
+            next_index = index + len("undefined")
+            following = raw[next_index] if next_index < len(raw) else ""
+            if (
+                not _is_javascript_identifier_char(previous)
+                and not _is_javascript_identifier_char(following)
+            ):
+                normalized.append("null")
+                index = next_index
+                continue
+
+        normalized.append(char)
+        index += 1
+    return "".join(normalized)
+
+
+def _parse_embedded_object(raw: str) -> dict:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        value = json5.loads(_normalize_javascript_literals(raw))
+    if not isinstance(value, dict):
+        raise ValueError("页面内嵌状态不是对象")
+    return value
+
+
 def _extract_json_object_after_marker(raw: str, marker: str) -> dict:
     marker_index = raw.find(marker)
     if marker_index < 0:
@@ -85,23 +165,23 @@ def _extract_json_object_after_marker(raw: str, marker: str) -> dict:
         raise ValueError(f"标记后未找到 JSON 对象: {marker}")
 
     depth = 0
-    in_string = False
+    quote = ""
     escape = False
     object_end = -1
 
     for index in range(object_start, len(raw)):
         char = raw[index]
-        if in_string:
+        if quote:
             if escape:
                 escape = False
             elif char == "\\":
                 escape = True
-            elif char == '"':
-                in_string = False
+            elif char == quote:
+                quote = ""
             continue
 
-        if char == '"':
-            in_string = True
+        if char in {'"', "'"}:
+            quote = char
             continue
         if char == "{":
             depth += 1
@@ -115,7 +195,7 @@ def _extract_json_object_after_marker(raw: str, marker: str) -> dict:
     if object_end <= object_start:
         raise ValueError(f"标记后的 JSON 对象不完整: {marker}")
 
-    return json.loads(raw[object_start:object_end])
+    return _parse_embedded_object(raw[object_start:object_end])
 
 
 def _extract_json_object_for_variable(raw: str, variable: str) -> dict:

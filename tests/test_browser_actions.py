@@ -138,6 +138,7 @@ def test_visible_fallback_keeps_totalv2_network_compatibility(monkeypatch) -> No
     actions._visible_auto_fetch_task_ids(23612045)
 
     assert captured["url_keyword"] == "/x/task/totalv2"
+    assert callable(captured["on_failure"])
     captured["on_network_match"](
         {
             "url": "https://api.bilibili.com/x/task/totalv2",
@@ -156,3 +157,50 @@ def test_visible_fallback_keeps_totalv2_network_compatibility(monkeypatch) -> No
 
     assert room_values == [23612045]
     assert task_values == ["network-task-a,network-task-b"]
+
+
+def test_visible_fallback_ignores_totalv2_before_entering_live_room(
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+    task_values: list[str] = []
+    monkeypatch.setattr(
+        browser_actions_module.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: browser_actions_module.QMessageBox.Ok,
+    )
+    actions = browser_actions_module.BrowserActions(
+        parent=None,
+        show_warning=lambda *_args: None,
+        show_error=lambda *_args: None,
+        post_ui_task=lambda callback, *args: callback(*args),
+        set_room_id=lambda _room_id: None,
+        set_cookie=lambda _cookie: None,
+        set_task_ids=task_values.append,
+    )
+    monkeypatch.setattr(actions, "pick_browser", lambda: "chrome")
+    monkeypatch.setattr(
+        actions,
+        "browser_sniff",
+        lambda url_keyword, hint, **kwargs: captured.update(kwargs),
+    )
+
+    actions._visible_auto_fetch_task_ids(23612045)
+
+    try:
+        captured["on_network_match"](
+            {
+                "url": "https://api.bilibili.com/x/task/totalv2",
+                "page_url": "https://www.bilibili.com/",
+                "data": {
+                    "code": 0,
+                    "data": {"list": [{"task_id": "unrelated-task"}]},
+                },
+            }
+        )
+    except ValueError as exc:
+        assert str(exc) == "尚未进入 Bilibili 直播间"
+    else:
+        raise AssertionError("主页请求不得提前结束直播间任务识别")
+
+    assert task_values == []

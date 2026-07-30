@@ -1,5 +1,6 @@
 httpx==0.28.1
 colorama==0.4.6
+json5==0.15.0
 PySide6==6.11.0
 apprise==1.12.0
 selenium==4.46.0

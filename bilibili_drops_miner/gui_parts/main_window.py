@@ -263,6 +263,7 @@ class MinerGUI(QMainWindow):
         self.concurrency_mode_combo = widgets.concurrency_mode_combo
         self.minimize_to_tray_check = widgets.minimize_to_tray_check
         self.close_to_tray_check = widgets.close_to_tray_check
+        self.auto_check_updates_check = widgets.auto_check_updates_check
         self.discover_btn = widgets.discover_btn
         self.overwatch_esports_btn = widgets.overwatch_esports_btn
         self.cookie_reveal_btn = widgets.cookie_reveal_btn
@@ -1103,7 +1104,10 @@ class MinerGUI(QMainWindow):
     # ---------- update check ----------
 
     def _check_update_silent(self) -> None:
-        if not should_check_update(APP_VERSION, UPDATE_CHANNEL):
+        if (
+            not self.auto_check_updates_check.isChecked()
+            or not should_check_update(APP_VERSION, UPDATE_CHANNEL)
+        ):
             return
 
         def _do() -> None:
@@ -1597,6 +1601,35 @@ class MinerGUI(QMainWindow):
         if session.session_id not in self._automatic_mining_session_ids:
             return
         group = result.selection.group
+        known_task_expired = (
+            session.task_ends_at is not None
+            and datetime.now(ZoneInfo("Asia/Shanghai")) >= session.task_ends_at
+        )
+        if result.selection.phase == "expired" or (
+            result.error and known_task_expired
+        ):
+            if session.controller.is_running and session.auto_started_runtime:
+                self._stop_account_session(session)
+            session.task_ids_text = ""
+            session.task_started_at = None
+            session.task_ends_at = None
+            session.latest_task_snapshot = TaskSnapshot()
+            if session.controller.is_running:
+                session.controller.update_task_ids([])
+            if session.session_id == self._active_session_id:
+                self.task_ids_edit.clear()
+                self._render_task_snapshot(session.latest_task_snapshot)
+            session.discovery_status_text = (
+                "后台自动挂机：旧任务已结束，已清除旧进度；"
+                "15 分钟后重新识别当天任务"
+            )
+            if session.session_id == self._active_session_id:
+                self._set_discovery_status(
+                    session.discovery_status_text,
+                    False,
+                )
+            self._update_global_run_controls()
+            return
         if result.error:
             session.discovery_status_text = (
                 f"后台自动检查未完成：{result.error}"
@@ -1617,6 +1650,7 @@ class MinerGUI(QMainWindow):
 
         session.task_ids_text = ",".join(group.task_ids)
         session.task_started_at = group.start_at
+        session.task_ends_at = group.end_at
         if session.controller.is_running:
             session.controller.update_task_ids(list(group.task_ids))
         if session.session_id == self._active_session_id:
@@ -2524,6 +2558,7 @@ class MinerGUI(QMainWindow):
         self.concurrency_mode_combo.setCurrentIndex(max(0, mode_index))
         self.minimize_to_tray_check.setChecked(values.minimize_to_tray)
         self.close_to_tray_check.setChecked(values.close_to_tray)
+        self.auto_check_updates_check.setChecked(values.auto_check_updates)
         self.apply_all_switch.setChecked(values.apply_to_all_accounts)
         # 后台自动挂机属于当前运行会话，不从设置恢复。这样重新打开程序
         # 只会加载账号和普通参数，不会在用户未点击按钮时自动启动挂机。
@@ -2575,6 +2610,9 @@ class MinerGUI(QMainWindow):
                     verbose=self.verbose_check.isChecked(),
                     minimize_to_tray=self.minimize_to_tray_check.isChecked(),
                     close_to_tray=self.close_to_tray_check.isChecked(),
+                    auto_check_updates=(
+                        self.auto_check_updates_check.isChecked()
+                    ),
                     # 后台自动挂机仅在当前运行中有效，不能成为启动项。
                     automatic_mining_enabled=False,
                     apply_to_all_accounts=self.apply_all_switch.isChecked(),

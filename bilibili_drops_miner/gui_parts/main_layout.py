@@ -100,6 +100,7 @@ class MainWindowWidgets:
     concurrency_mode_combo: QComboBox
     minimize_to_tray_check: QCheckBox
     close_to_tray_check: QCheckBox
+    auto_check_updates_check: QCheckBox
     discover_btn: QPushButton
     overwatch_esports_btn: QPushButton
     cookie_reveal_btn: QPushButton
@@ -470,10 +471,16 @@ def build_main_window_layout(
     minimize_to_tray_check.setChecked(True)
     close_to_tray_check = QCheckBox("关闭到托盘")
     close_to_tray_check.setChecked(True)
+    auto_check_updates_check = QCheckBox("启动时检查更新")
+    auto_check_updates_check.setChecked(True)
+    auto_check_updates_check.setToolTip(
+        "只检查 GitHub Release；发现新版本后询问是否打开发布页，不自动下载或安装"
+    )
     desktop_options = QHBoxLayout()
     desktop_options.setSpacing(20)
     desktop_options.addWidget(minimize_to_tray_check)
     desktop_options.addWidget(close_to_tray_check)
+    desktop_options.addWidget(auto_check_updates_check)
     desktop_options.addStretch(1)
     desktop_layout.addLayout(desktop_options)
     advanced_stack.addWidget(desktop_group)
@@ -533,6 +540,7 @@ def build_main_window_layout(
         concurrency_mode_combo=concurrency_mode_combo,
         minimize_to_tray_check=minimize_to_tray_check,
         close_to_tray_check=close_to_tray_check,
+        auto_check_updates_check=auto_check_updates_check,
         discover_btn=discover_btn,
         overwatch_esports_btn=overwatch_esports_btn,
         cookie_reveal_btn=cookie_reveal_btn,

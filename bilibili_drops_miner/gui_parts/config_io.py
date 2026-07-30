@@ -29,6 +29,7 @@ class GuiConfigValues:
     concurrency_mode: str
     minimize_to_tray: bool
     close_to_tray: bool
+    auto_check_updates: bool
     automatic_mining_enabled: bool
     apply_to_all_accounts: bool
 
@@ -61,6 +62,7 @@ def values_from_config_data(data: dict[str, Any]) -> GuiConfigValues:
         concurrency_mode=concurrency_mode,
         minimize_to_tray=bool(data.get("minimize_to_tray", True)),
         close_to_tray=bool(data.get("close_to_tray", True)),
+        auto_check_updates=bool(data.get("auto_check_updates", True)),
         automatic_mining_enabled=bool(
             data.get("automatic_mining_enabled", False)
         ),
@@ -77,6 +79,7 @@ def build_config_payload(
     include_secrets: bool = False,
     minimize_to_tray: bool = True,
     close_to_tray: bool = True,
+    auto_check_updates: bool = True,
     automatic_mining_enabled: bool = False,
     apply_to_all_accounts: bool = False,
 ) -> dict[str, Any]:
@@ -92,6 +95,7 @@ def build_config_payload(
         "concurrency_policy_version": CONCURRENCY_POLICY_VERSION,
         "minimize_to_tray": minimize_to_tray,
         "close_to_tray": close_to_tray,
+        "auto_check_updates": auto_check_updates,
         "automatic_mining_enabled": automatic_mining_enabled,
         "apply_to_all_accounts": apply_to_all_accounts,
         "verbose": verbose,

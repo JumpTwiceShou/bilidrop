@@ -1,4 +1,4 @@
-APP_VERSION = "v2.0.0"
+APP_VERSION = "v2.0.1"
 UPDATE_CHANNEL = "release"
 REPOSITORY_URL = "https://github.com/JumpTwiceShou/bilidrop"
 LATEST_RELEASE_API = "https://api.github.com/repos/JumpTwiceShou/bilidrop/releases/latest"

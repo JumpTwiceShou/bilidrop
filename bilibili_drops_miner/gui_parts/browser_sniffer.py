@@ -253,7 +253,7 @@ def start_browser_sniff(
                     not need_html
                     or not finish_on_any
                     or html_done
-                    or html_attempts >= 3
+                    or html_attempts >= 1
                 )
                 if (
                     need_net
@@ -284,6 +284,10 @@ def start_browser_sniff(
                     break
 
                 time.sleep(1)
+            else:
+                raise TimeoutError(
+                    "2 分钟内未捕获到有效结果，浏览器已自动关闭，请重新识别"
+                )
 
         except ImportError as exc:
             on_error("依赖缺失", f"缺少依赖库，请安装后重试: {exc}\n\n")

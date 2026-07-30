@@ -124,6 +124,81 @@ def test_current_nested_eva_activity_task_groups() -> None:
     ]
 
 
+def test_minified_javascript_activity_selects_current_dated_panel() -> None:
+    html = """
+    <script>
+    window.__BILIACT_EVAPAGEDATA__={
+      layerTree:[{
+        name:"EvaTabs",
+        props:{activatedTabPanelId:"day-two",enabled:!0,hidden:!1},
+        slots:[{children:[
+          {
+            name:"EvaTabs.Panel",
+            props:{
+              id:"day-one",
+              tabItem:{tabItemProps:{textContent:{content:"DAY1观赛奖励"}}}
+            },
+            slots:[{children:[
+              {name:"EvaText",props:{content:"2026年7月29日 17:30-2026年7月30日 17:00"}},
+              {name:"EraTasklistPc",props:{tasklist:[{taskId:"old-task"}]}}
+            ]}]
+          },
+          {
+            name:"EvaTabs.Panel",
+            props:{
+              id:"day-two",
+              tabItem:{activatedTabItemProps:{textContent:{content:"DAY2观赛奖励"}}}
+            },
+            slots:[{children:[
+              {name:"EvaText",props:{content:"2026年7月30日 17:30-2026年7月31日 17:00"}},
+              {name:"EraTasklistPc",props:{tasklist:[{taskId:"current-task"}]}}
+            ]}]
+          }
+        ]}]
+      }],
+      optionalValue:undefined
+    };
+    </script>
+    """
+
+    groups = extract_bili_live_task_groups(html)
+
+    assert groups == [
+        {
+            "label": "DAY1观赛奖励",
+            "task_ids": ["old-task"],
+            "active": False,
+            "start_at": "2026-07-29T17:30:00+08:00",
+            "end_at": "2026-07-30T17:00:00+08:00",
+        },
+        {
+            "label": "DAY2观赛奖励",
+            "task_ids": ["current-task"],
+            "active": True,
+            "start_at": "2026-07-30T17:30:00+08:00",
+            "end_at": "2026-07-31T17:00:00+08:00",
+        },
+    ]
+
+
+def test_minifier_boolean_tokens_inside_strings_are_not_changed() -> None:
+    html = """
+    <script>
+    window.__BILIACT_EVAPAGEDATA__={
+      layerTree:[{
+        name:"EraTasklistPc",
+        props:{tasklist:[{taskId:"literal-!0-!1-undefined"}]},
+        slots:[]
+      }]
+    };
+    </script>
+    """
+
+    assert extract_bili_live_task_groups(html)[0]["task_ids"] == [
+        "literal-!0-!1-undefined"
+    ]
+
+
 def test_nested_activity_group_keeps_shanghai_schedule() -> None:
     state = {
         "layerTree": [

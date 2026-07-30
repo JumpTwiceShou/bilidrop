@@ -64,6 +64,7 @@ class AccountWorkspace:
     automatic_check_inflight: bool = False
     automatic_check_pending: bool = False
     task_started_at: datetime | None = None
+    task_ends_at: datetime | None = None
     application_state: ApplicationState = ApplicationState.IDLE
     runtime_health: RuntimeHealth = field(default_factory=RuntimeHealth)
     latest_task_snapshot: TaskSnapshot = field(default_factory=TaskSnapshot)

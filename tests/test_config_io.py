@@ -34,6 +34,7 @@ def test_new_settings_payload_excludes_secrets() -> None:
         verbose=False,
         minimize_to_tray=False,
         close_to_tray=True,
+        auto_check_updates=False,
         automatic_mining_enabled=True,
         apply_to_all_accounts=True,
     )
@@ -42,6 +43,7 @@ def test_new_settings_payload_excludes_secrets() -> None:
     assert payload["concurrency_mode"] == "automatic"
     assert payload["minimize_to_tray"] is False
     assert payload["close_to_tray"] is True
+    assert payload["auto_check_updates"] is False
     assert payload["automatic_mining_enabled"] is True
     assert payload["apply_to_all_accounts"] is True
     assert payload["concurrency_policy_version"] == 2
@@ -67,6 +69,7 @@ def test_missing_session_count_uses_new_default() -> None:
     assert values.thread_count_text == "16"
     assert values.concurrency_mode == "automatic"
     assert values.apply_to_all_accounts is False
+    assert values.auto_check_updates is True
 
 
 def test_legacy_implicit_fixed_mode_migrates_to_automatic() -> None:

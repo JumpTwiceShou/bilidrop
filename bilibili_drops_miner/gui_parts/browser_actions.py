@@ -224,8 +224,11 @@ class BrowserActions:
         on_page_html: Callable[[str, str], bool] | None = None,
         browser_preference: str | None = None,
         finish_on_any: bool = False,
+        on_failure: Callable[[str], None] | None = None,
     ) -> None:
         def on_error(title: str, message: str) -> None:
+            if on_failure is not None:
+                self._post_ui_task(on_failure, message)
             self._post_ui_task(self._show_error, title, message)
 
         start_browser_sniff(
@@ -317,6 +320,16 @@ class BrowserActions:
                     "label": group.label,
                     "task_ids": list(group.task_ids),
                     "active": group.active,
+                    "start_at": (
+                        group.start_at.isoformat()
+                        if group.start_at is not None
+                        else None
+                    ),
+                    "end_at": (
+                        group.end_at.isoformat()
+                        if group.end_at is not None
+                        else None
+                    ),
                 }
                 for group in result.groups
             ]
@@ -374,12 +387,13 @@ class BrowserActions:
             payload_data = payload if isinstance(payload, dict) else {}
             request_url = str(payload_data.get("url") or "")
             page_url = str(payload_data.get("page_url") or "")
-            room_id = extract_room_id_from_live_url(page_url)
-            if room_id is None:
-                room_id = extract_room_id_from_live_url(request_url)
-            if room_id is not None:
-                self._post_ui_task(self._set_room_id, room_id)
-                self._logger.info("房间号获取成功: %s", room_id)
+            captured_room_id = extract_room_id_from_live_url(page_url)
+            if captured_room_id is None:
+                raise ValueError("尚未进入 Bilibili 直播间")
+            if room_id is not None and captured_room_id != room_id:
+                raise ValueError("尚未进入待识别的目标直播间")
+            self._post_ui_task(self._set_room_id, captured_room_id)
+            self._logger.info("房间号获取成功: %s", captured_room_id)
 
             data = payload_data.get("data")
             if not isinstance(data, dict):
@@ -403,6 +417,10 @@ class BrowserActions:
             on_page_html=on_page_html,
             browser_preference=browser,
             finish_on_any=True,
+            on_failure=lambda message: self._set_discovery_status(
+                f"浏览器兜底识别失败：{message}",
+                True,
+            ),
         )
 
     def cancel_discovery(self) -> None:
