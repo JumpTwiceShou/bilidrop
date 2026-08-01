@@ -883,6 +883,25 @@ def test_claimed_rewards_stop_watch_threads_but_keep_monitoring(window) -> None:
         ["daily"]
     )
     assert "观看线程已自动关闭" in session.discovery_status_text
+    assert window.runtime_state_label.text() == "持续监测任务中"
+
+
+def test_idle_badge_returns_to_not_running_after_monitoring_is_disabled(
+    window,
+) -> None:
+    session = window._active_session
+    window._automatic_mining_session_ids.add(session.session_id)
+
+    window._set_application_state(ApplicationState.IDLE)
+
+    assert window.runtime_state_label.text() == "持续监测任务中"
+    assert window.cookie_edit.isEnabled()
+    assert window.rooms_edit.isEnabled()
+
+    window._automatic_mining_session_ids.discard(session.session_id)
+    window._set_application_state(ApplicationState.IDLE)
+
+    assert window.runtime_state_label.text() == "未运行"
 
 
 def test_restart_after_claimed_guard_disables_auto_pause_for_this_run(

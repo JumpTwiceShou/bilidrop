@@ -2593,7 +2593,16 @@ class MinerGUI(QMainWindow):
             ApplicationState.STOPPING: ("停止中", "#9a3412"),
             ApplicationState.ERROR: ("异常", "#991b1b"),
         }
-        text, background = labels[state]
+        monitoring_without_watch_threads = (
+            state == ApplicationState.IDLE
+            and session is not None
+            and session.session_id in self._automatic_mining_session_ids
+        )
+        text, background = (
+            ("持续监测任务中", "#1d4ed8")
+            if monitoring_without_watch_threads
+            else labels[state]
+        )
         self.runtime_state_label.setText(text)
         self.runtime_state_label.setStyleSheet(
             f"background:{background};color:#ffffff;border-radius:12px;"
