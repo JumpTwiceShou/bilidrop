@@ -26,6 +26,7 @@ class MinerConfig:
     notify_on_task_complete: bool = True
     concurrency_mode: str = "fixed"
     task_started_at: datetime | None = None
+    automatic_start_in_steady_mode: bool = False
 
     def validate(self) -> None:
         if not self.cookie.strip():

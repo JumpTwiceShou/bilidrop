@@ -8,7 +8,7 @@ import threading
 import webbrowser
 from dataclasses import replace
 from datetime import datetime
-from time import time
+from time import monotonic, time
 from zoneinfo import ZoneInfo
 
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
@@ -26,9 +26,11 @@ from PySide6.QtWidgets import (
 )
 
 from bilibili_drops_miner.client import BilibiliClient
+from bilibili_drops_miner.account_settings import AccountSettings
 from bilibili_drops_miner.automatic_mining import (
     AutomaticAccountCheckResult,
     ScheduledTaskSelection,
+    all_task_rewards_claimed,
     all_tasks_completed,
     claimable_reward_task_ids,
     select_scheduled_task_group,
@@ -60,6 +62,11 @@ from bilibili_drops_miner.gui_parts.cookie_profiles import (
     now_text,
     save_cookie_profiles,
 )
+from bilibili_drops_miner.gui_parts.concurrency_dialog import (
+    ONE_TIME_BOOST_SESSIONS,
+    PERSISTENT_HIGH_SESSIONS,
+    choose_concurrency_boost_mode,
+)
 from bilibili_drops_miner.gui_parts.log_handler import QueueLogHandler
 from bilibili_drops_miner.gui_parts.main_layout import (
     MainWindowCallbacks,
@@ -84,6 +91,15 @@ from bilibili_drops_miner.gui_parts.window_chrome import (
 )
 from bilibili_drops_miner.logging_utils import redact_sensitive_text, setup_logging
 from bilibili_drops_miner.notifier import MultiPlatformNotifier
+from bilibili_drops_miner.request_coordinator import (
+    TASK_API_GROUP,
+    looks_rate_limited,
+)
+from bilibili_drops_miner.runtime_state import (
+    AutomationState,
+    RunOwner,
+    TaskPhase,
+)
 from bilibili_drops_miner.task_discovery import TaskDiscoveryService
 from bilibili_drops_miner.utils import (
     parse_notification_urls,
@@ -107,6 +123,7 @@ except Exception:
     RELEASES_URL = "https://github.com/JumpTwiceShou/bilidrop/releases/latest"
 
 OVERWATCH_ESPORTS_ROOM_ID = 23612045
+AUTOMATIC_STEADY_GUARD_SECONDS = 15 * 60
 
 
 def _normalize_version(value: str) -> str:
@@ -144,6 +161,7 @@ class MinerGUI(QMainWindow):
         self._pending_start_after_discovery = False
         self._rediscovery_attempted_for_run = False
         self._automatic_mining_session_ids: set[str] = set()
+        self._global_account_defaults = AccountSettings()
         self._exit_requested = False
         self._tray_icon: QSystemTrayIcon | None = None
         self.ui_call.connect(self._on_ui_call, Qt.QueuedConnection)
@@ -222,7 +240,7 @@ class MinerGUI(QMainWindow):
                 auto_fetch_task_ids=self.auto_fetch_task_ids,
                 auto_fetch_overwatch_esports=self.auto_fetch_overwatch_esports,
                 toggle_run=self.toggle_run_scope,
-                toggle_background_auto=self.toggle_background_auto_scope,
+                boost_concurrency=self.boost_concurrency_scope,
                 load_config=self.load_config,
                 save_config=self.save_config,
                 select_cookie_profile=self._on_cookie_profile_selected,
@@ -257,7 +275,7 @@ class MinerGUI(QMainWindow):
         self.settings_button = widgets.settings_button
         self.claim_rewards_btn = widgets.claim_rewards_btn
         self.start_btn = widgets.start_btn
-        self.enable_auto_btn = widgets.enable_auto_btn
+        self.boost_concurrency_btn = widgets.boost_concurrency_btn
         self.apply_all_switch = widgets.apply_all_switch
         self.auto_mining_description = widgets.auto_mining_description
         self.concurrency_mode_combo = widgets.concurrency_mode_combo
@@ -346,6 +364,7 @@ class MinerGUI(QMainWindow):
             runtime_is_running=lambda: session.controller.is_running,
             request_runtime_refresh=session.controller.request_task_refresh,
             claim_runtime_rewards=session.controller.claim_rewards,
+            request_coordinator=session.request_coordinator,
         )
         if (
             hasattr(self, "apply_all_switch")
@@ -353,6 +372,8 @@ class MinerGUI(QMainWindow):
             and self._automatic_mining_session_ids
         ):
             self._automatic_mining_session_ids.add(session.session_id)
+            session.automation_state = AutomationState.ARMED
+            session.automatic_guard_started_at = monotonic()
             session.next_automatic_check_at = 0.0
         return session
 
@@ -374,6 +395,9 @@ class MinerGUI(QMainWindow):
         session = self._account_sessions.get(self._active_session_id)
         if session is None:
             return
+        previous_cookie = session.cookie
+        previous_rooms = session.rooms_text
+        previous_task_ids = session.task_ids_text
         if not preserve_account_fields:
             cookie = self.cookie_edit.text().strip()
             if cookie != session.cookie:
@@ -398,6 +422,59 @@ class MinerGUI(QMainWindow):
         session.pending_start_after_discovery = self._pending_start_after_discovery
         session.rediscovery_attempted_for_run = self._rediscovery_attempted_for_run
         session.discovery_status_text = self.discovery_status_label.text()
+        if (
+            previous_cookie != session.cookie
+            or previous_rooms != session.rooms_text
+            or previous_task_ids != session.task_ids_text
+        ):
+            session.bump_configuration_generation()
+
+    @staticmethod
+    def _account_settings_from_session(
+        session: AccountWorkspace,
+    ) -> AccountSettings:
+        return AccountSettings(
+            rooms_text=session.rooms_text,
+            thread_count=session.thread_count,
+            reconnect_delay_seconds=session.reconnect_delay_seconds,
+            task_query_interval_seconds=session.task_query_interval_seconds,
+            notify_on_task_complete=session.notify_on_task_complete,
+            concurrency_mode=session.concurrency_mode,
+        )
+
+    @staticmethod
+    def _apply_account_settings(
+        session: AccountWorkspace,
+        settings: AccountSettings,
+    ) -> None:
+        session.rooms_text = settings.rooms_text
+        session.thread_count = settings.thread_count
+        session.reconnect_delay_seconds = settings.reconnect_delay_seconds
+        session.task_query_interval_seconds = (
+            settings.task_query_interval_seconds
+        )
+        session.notify_on_task_complete = settings.notify_on_task_complete
+        session.concurrency_mode = settings.concurrency_mode
+
+    def _sync_cookie_profile_settings(self) -> None:
+        for profile in self._cookie_profiles:
+            session = next(
+                (
+                    item
+                    for item in self._account_sessions.values()
+                    if (
+                        item.credential_id
+                        and item.credential_id == profile.credential_id
+                    )
+                    or item.cookie == profile.cookie
+                ),
+                None,
+            )
+            if session is None or not session.account_settings_saved:
+                continue
+            profile.settings = self._account_settings_from_session(
+                session
+            ).to_mapping()
 
     def _restore_active_session(self) -> None:
         session = self._active_session
@@ -615,13 +692,16 @@ class MinerGUI(QMainWindow):
             logging.getLogger(__name__).warning("Cookie档案加载失败: %s", exc)
 
         for profile in self._cookie_profiles:
-            self._register_account_session(
-                AccountWorkspace.saved_account(
-                    credential_id=profile.credential_id,
-                    cookie=profile.cookie,
-                    remark=profile.remark,
-                )
+            session = AccountWorkspace.saved_account(
+                credential_id=profile.credential_id,
+                cookie=profile.cookie,
+                remark=profile.remark,
             )
+            account_settings = AccountSettings.from_mapping(profile.settings)
+            if account_settings is not None:
+                self._apply_account_settings(session, account_settings)
+                session.account_settings_saved = True
+            self._register_account_session(session)
 
         selected = next(
             (
@@ -684,7 +764,15 @@ class MinerGUI(QMainWindow):
 
             state = LoginState.ERROR
             detected_uid = ""
+            permit = session.request_coordinator.acquire(
+                "login-validation",
+                group="auth-api",
+                timeout_seconds=5.0,
+            )
+            validation_error: BaseException | None = None
             try:
+                if permit is None:
+                    raise RuntimeError("登录校验请求正在执行或冷却中")
                 uid, _uname = asyncio.run(_probe())
                 if uid:
                     state = LoginState.VALID
@@ -692,12 +780,24 @@ class MinerGUI(QMainWindow):
                 else:
                     state = LoginState.INVALID
             except Exception as exc:
+                validation_error = exc
                 detail = str(exc).strip() or type(exc).__name__
                 logging.getLogger(__name__).warning(
                     "账号登录状态检测失败 UID %s: %s",
                     session.uid or "未知",
                     detail,
                 )
+            finally:
+                if permit is not None:
+                    session.request_coordinator.finish(
+                        permit,
+                        cooldown_seconds=(
+                            30.0
+                            if validation_error is not None
+                            and looks_rate_limited(validation_error)
+                            else 0.0
+                        ),
+                    )
             self._post_ui_task(
                 self._apply_account_login_state,
                 session_id,
@@ -742,6 +842,7 @@ class MinerGUI(QMainWindow):
             self._credential_store.delete("notification-urls")
 
     def _write_cookie_profiles(self) -> None:
+        self._sync_cookie_profile_settings()
         save_cookie_profiles(
             self._cookie_profiles,
             credential_store=self._credential_store,
@@ -986,6 +1087,7 @@ class MinerGUI(QMainWindow):
             cookie=cookie,
             updated_at=now_text(),
             credential_id=session.credential_id,
+            settings=self._account_settings_from_session(session).to_mapping(),
         )
 
         target_index = self._find_cookie_profile_to_update(cookie, remark)
@@ -1026,6 +1128,7 @@ class MinerGUI(QMainWindow):
             session.remark = remark
             session.credential_id = profile.credential_id
             session.temporary = False
+            session.account_settings_saved = True
             self._last_selected_credential_id = profile.credential_id
             # 第一次保存时 credential_id 由存储层生成，需要再写一次才能记录“最近使用”。
             self._write_cookie_profiles()
@@ -1145,26 +1248,59 @@ class MinerGUI(QMainWindow):
     def _build_session_config(
         self,
         session: AccountWorkspace,
+        *,
+        automatic_start_in_steady_mode: bool = False,
+        automatic_catchup_sessions: int | None = None,
     ) -> MinerConfig:
+        runtime_override = session.runtime_concurrency_override
+        thread_count = runtime_override or session.thread_count
+        if (
+            automatic_catchup_sessions is not None
+            and runtime_override is None
+            and session.concurrency_mode == "automatic"
+        ):
+            thread_count = automatic_catchup_sessions
         return MinerConfig(
             cookie=session.cookie.strip(),
             room_ids=parse_room_ids(session.rooms_text.strip()),
-            thread_count=session.thread_count,
+            thread_count=thread_count,
             reconnect_delay_seconds=session.reconnect_delay_seconds,
             enable_web_heartbeat=True,
             task_ids=parse_task_ids(session.task_ids_text.strip()),
             task_query_interval_seconds=session.task_query_interval_seconds,
             notify_urls=parse_notification_urls(self.notify_urls_edit.text().strip()),
             notify_on_task_complete=session.notify_on_task_complete,
-            concurrency_mode=session.concurrency_mode,
+            concurrency_mode=(
+                "fixed"
+                if runtime_override is not None
+                else session.concurrency_mode
+            ),
             task_started_at=session.task_started_at,
+            automatic_start_in_steady_mode=(
+                automatic_start_in_steady_mode
+                and runtime_override is None
+                and session.concurrency_mode == "automatic"
+            ),
         )
 
     # ---------- start / stop ----------
 
+    @staticmethod
+    def _completion_run_key(
+        task_ids: list[str] | tuple[str, ...],
+    ) -> tuple[str, tuple[str, ...]] | None:
+        normalized = tuple(dict.fromkeys(task_id for task_id in task_ids if task_id))
+        if not normalized:
+            return None
+        day = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+        return day, normalized
+
     def start(self) -> None:
         self._capture_active_session()
-        self._start_account_session(self._active_session, interactive=True)
+        self._start_continuous_scope(
+            (self._active_session,),
+            interactive=True,
+        )
 
     def _start_account_session(
         self,
@@ -1172,6 +1308,7 @@ class MinerGUI(QMainWindow):
         *,
         interactive: bool,
         automatic: bool = False,
+        automatic_start_in_steady_mode: bool = False,
     ) -> bool:
         logger = logging.getLogger(__name__)
         session_id = session.session_id
@@ -1184,8 +1321,23 @@ class MinerGUI(QMainWindow):
             return False
         try:
             self._install_logging()
-            config = self._build_session_config(session)
+            automatic_catchup_sessions = (
+                32 if self._concurrent_account_count() == 1 else 16
+            )
+            config = self._build_session_config(
+                session,
+                automatic_start_in_steady_mode=(
+                    automatic_start_in_steady_mode
+                ),
+                automatic_catchup_sessions=automatic_catchup_sessions,
+            )
             config.validate()
+            completion_key = self._completion_run_key(config.task_ids)
+            session.completion_auto_stop_bypass = bool(
+                not automatic
+                and completion_key is not None
+                and session.completion_auto_stop_key == completion_key
+            )
         except Exception as exc:
             if interactive:
                 self._show_error("配置错误", str(exc))
@@ -1196,7 +1348,7 @@ class MinerGUI(QMainWindow):
                     exc,
                 )
             return False
-        if not session.temporary and session.login_state != LoginState.VALID:
+        if session.login_state != LoginState.VALID:
             if session.login_state == LoginState.INVALID:
                 if interactive:
                     self._show_warning(
@@ -1205,7 +1357,7 @@ class MinerGUI(QMainWindow):
                     )
                 else:
                     logger.warning(
-                        "账号 UID %s 登录已失效，后台自动挂机已跳过",
+                        "账号 UID %s 登录已失效，持续任务检测已跳过",
                         session.uid or "未知",
                     )
                 return False
@@ -1217,31 +1369,69 @@ class MinerGUI(QMainWindow):
                     "需要先确认账号登录有效。请稍等片刻；如果显示登录失效，请重新扫码登录。",
                 )
             return False
-        if not session.controller.start(
-            config,
-            logger=logger,
-            on_health=lambda health: self._post_ui_task(
-                self._apply_session_runtime_health, session_id, health
-            ),
-            on_task_snapshot=lambda snapshot: self._post_ui_task(
-                self._apply_session_task_snapshot, session_id, snapshot
-            ),
-        ):
+        previous_owner = session.run_owner
+        previous_automation_state = session.automation_state
+        session.run_owner = RunOwner.AUTO if automatic else RunOwner.MANUAL
+        if automatic:
+            session.automation_state = AutomationState.AUTO_RUNNING
+        try:
+            started = session.controller.start(
+                config,
+                logger=logger,
+                on_health=lambda health: self._post_ui_task(
+                    self._apply_session_runtime_health, session_id, health
+                ),
+                on_task_snapshot=lambda snapshot: self._post_ui_task(
+                    self._apply_session_task_snapshot, session_id, snapshot
+                ),
+                on_rewards_settled=lambda task_ids: self._post_ui_task(
+                    self._stop_runtime_after_rewards_claimed,
+                    session_id,
+                    task_ids,
+                ),
+                request_coordinator=session.request_coordinator,
+            )
+        except Exception as exc:
+            session.run_owner = previous_owner
+            session.automation_state = previous_automation_state
+            logger.exception("账号 UID %s 启动失败", session.uid or "未知")
+            if interactive:
+                self._show_error("启动失败", str(exc).strip() or type(exc).__name__)
+            return False
+        if not started:
+            session.run_owner = previous_owner
+            session.automation_state = previous_automation_state
             if interactive:
                 self._show_info("运行中", "这个账号已在挂机。")
             return False
-        session.auto_started_runtime = automatic
         session.application_state = ApplicationState.STARTING
         session.runtime_health = RuntimeHealth(
             state=ApplicationState.STARTING,
             concurrency_mode=config.concurrency_mode,
             concurrency_phase=(
-                "catchup" if config.concurrency_mode == "automatic" else "fixed"
+                (
+                    "steady"
+                    if config.automatic_start_in_steady_mode
+                    else "catchup"
+                )
+                if config.concurrency_mode == "automatic"
+                else "fixed"
             ),
             concurrency_detail=(
-                "自动并发正在启动并收集任务进度"
+                (
+                    "后台已守候至少 15 分钟，新任务先以每房间 2 个会话启动"
+                    if config.automatic_start_in_steady_mode
+                    else (
+                        f"自动并发从每房间 {config.thread_count} 个会话"
+                        "启动并收集任务进度"
+                    )
+                )
                 if config.concurrency_mode == "automatic"
-                else f"固定并发：每房间 {config.thread_count} 个会话"
+                else (
+                    f"手动加速：每房间固定 {config.thread_count} 个会话"
+                    if session.runtime_concurrency_override is not None
+                    else f"固定并发：每房间 {config.thread_count} 个会话"
+                )
             ),
         )
         session.pending_start_after_discovery = False
@@ -1250,7 +1440,27 @@ class MinerGUI(QMainWindow):
             self._set_application_state(ApplicationState.STARTING)
             self._pending_start_after_discovery = False
             self._rediscovery_attempted_for_run = False
-        logger.info("账号 UID %s 的掉宝助手已启动", session.uid or "未知")
+        logger.info(
+            "账号 UID %s 的掉宝助手已启动（所有者: %s，触发: %s）",
+            session.uid or "未知",
+            session.run_owner.value,
+            (
+                "后台守候发现任务"
+                if automatic_start_in_steady_mode
+                else "后台立即启动" if automatic else "用户手动启动"
+            ),
+        )
+        if session.completion_auto_stop_bypass:
+            message = (
+                "平台此前已把这组当天奖励判定为全部领取；"
+                "已按你的要求继续挂机，本次不会自动暂停，请手动停止"
+            )
+            session.discovery_status_text = message
+            logger.warning("账号 UID %s：%s", session.uid or "未知", message)
+            if interactive:
+                self._show_info("继续挂机", message)
+            if session_id == self._active_session_id:
+                self._set_discovery_status(message, False)
         if not config.task_ids:
             message = "未识别任务，已直接开始挂机；任务进度和自动领奖暂不可用"
             session.discovery_status_text = message
@@ -1265,7 +1475,7 @@ class MinerGUI(QMainWindow):
 
     def stop(self) -> None:
         self._capture_active_session()
-        self._stop_account_session(self._active_session)
+        self._stop_continuous_scope((self._active_session,))
 
     def _stop_account_session(self, session: AccountWorkspace) -> None:
         logger = logging.getLogger(__name__)
@@ -1283,7 +1493,8 @@ class MinerGUI(QMainWindow):
             self._stop_poll_timer.start()
         elif result == "not_running":
             session.application_state = ApplicationState.IDLE
-            session.auto_started_runtime = False
+            session.run_owner = RunOwner.NONE
+            session.runtime_concurrency_override = None
             if is_active:
                 self._set_application_state(ApplicationState.IDLE)
         self._refresh_cookie_profile_combo(selected_session_id=session.session_id)
@@ -1334,81 +1545,128 @@ class MinerGUI(QMainWindow):
             return tuple(self._account_sessions.values())
         return (self._active_session,)
 
+    def _concurrent_account_count(self) -> int:
+        """Count accounts that can participate in this run decision."""
+        return max(
+            1,
+            sum(
+                1
+                for session in self._account_sessions.values()
+                if session.controller.is_running
+                or (
+                    session.cookie.strip()
+                    and (
+                        session.login_state == LoginState.VALID
+                        or session.session_id
+                        in self._automatic_mining_session_ids
+                    )
+                )
+            ),
+        )
+
+    def _boostable_scope_sessions(self) -> tuple[AccountWorkspace, ...]:
+        return tuple(
+            session
+            for session in self._scope_sessions()
+            if session.cookie.strip() or session.controller.is_running
+        )
+
     def toggle_run_scope(self) -> None:
         self._capture_active_session()
         sessions = self._scope_sessions()
         if any(session.controller.is_running for session in sessions):
-            for session in sessions:
-                if session.controller.is_running:
-                    self._stop_account_session(session)
-            return
-        template = self._active_session
-        for session in sessions:
-            self._seed_session_runtime_config(session, template)
-            self._start_account_session(
-                session,
+            self._stop_continuous_scope(sessions)
+        else:
+            self._start_continuous_scope(
+                sessions,
                 interactive=len(sessions) == 1,
             )
         self._update_global_run_controls()
 
-    def toggle_background_auto_scope(self) -> None:
-        sessions = self._scope_sessions()
+    def _start_continuous_scope(
+        self,
+        sessions: tuple[AccountWorkspace, ...],
+        *,
+        interactive: bool,
+    ) -> None:
+        if not sessions:
+            return
+        template = self._active_session
+        now = monotonic()
+        for session in sessions:
+            self._seed_session_runtime_config(session, template)
+            if session.session_id not in self._automatic_mining_session_ids:
+                session.automatic_guard_started_at = now
+            session.automation_state = AutomationState.ARMED
+            session.next_automatic_check_at = 0.0
+            self._automatic_mining_session_ids.add(session.session_id)
+        for session in sessions:
+            started = self._start_account_session(
+                session,
+                interactive=interactive,
+            )
+            if started or session.login_state == LoginState.CHECKING:
+                continue
+            self._automatic_mining_session_ids.discard(session.session_id)
+            session.automatic_guard_started_at = None
+            session.automation_state = AutomationState.OFF
+        logging.getLogger(__name__).info(
+            "持续挂机已开启，作用范围：%s；全部领奖后关闭观看线程并保留任务检测",
+            "所有账号" if len(sessions) > 1 else "当前账号",
+        )
+        QTimer.singleShot(0, self._automatic_mining_tick)
+
+    def _stop_continuous_scope(
+        self,
+        sessions: tuple[AccountWorkspace, ...],
+        *,
+        disable_monitoring: bool = False,
+    ) -> None:
         session_ids = {session.session_id for session in sessions}
-        if any(
-            session_id in self._automatic_mining_session_ids
-            for session_id in session_ids
-        ):
+        if disable_monitoring:
             self._automatic_mining_session_ids.difference_update(session_ids)
-            stopped = self._stop_auto_started_sessions(session_ids)
-            logging.getLogger(__name__).info(
-                "已停止%s的后台自动挂机；同时停止 %s 个由后台自动启动的挂机",
-                "所有账号" if self.apply_all_switch.isChecked() else "当前账号",
-                stopped,
-            )
-        else:
-            self._capture_active_session()
-            template = self._active_session
-            self._automatic_mining_session_ids.update(session_ids)
-            for session in sessions:
-                self._seed_session_runtime_config(session, template)
-                session.next_automatic_check_at = 0.0
-            logging.getLogger(__name__).info(
-                "后台自动挂机已开启，作用范围：%s",
-                "所有账号" if self.apply_all_switch.isChecked() else "当前账号",
-            )
-            QTimer.singleShot(0, self._automatic_mining_tick)
-        self._update_global_run_controls()
+        stopped = 0
+        for session in sessions:
+            if disable_monitoring:
+                session.automatic_guard_started_at = None
+                session.automation_state = AutomationState.OFF
+            elif session.session_id in self._automatic_mining_session_ids:
+                session.automation_state = AutomationState.ARMED
+            if session.controller.is_running:
+                self._stop_account_session(session)
+                stopped += 1
+        logging.getLogger(__name__).info(
+            "%s，作用范围：%s；已请求停止 %s 个账号的观看会话",
+            (
+                "任务监测与观看会话已停止"
+                if disable_monitoring
+                else "观看会话已停止，后台任务监测继续运行"
+            ),
+            "所有账号" if len(sessions) > 1 else "当前账号",
+            stopped,
+        )
+
+    def toggle_background_auto_scope(self) -> None:
+        """Compatibility alias for the v2.0 two-button interface."""
+        self.toggle_run_scope()
 
     def enable_background_auto(self) -> None:
         """Compatibility entrypoint used by tests and tray integrations."""
         self._capture_active_session()
-        template = self._active_session
         sessions = self._scope_sessions()
-        self._automatic_mining_session_ids.update(
-            session.session_id for session in sessions
-        )
-        for session in sessions:
-            self._seed_session_runtime_config(session, template)
-            session.next_automatic_check_at = 0.0
+        if not any(session.controller.is_running for session in sessions):
+            self._start_continuous_scope(
+                sessions,
+                interactive=len(sessions) == 1,
+            )
         self._update_global_run_controls()
-        logging.getLogger(__name__).info(
-            "后台自动挂机已开启，作用范围：%s",
-            "所有账号" if self.apply_all_switch.isChecked() else "当前账号",
-        )
-        QTimer.singleShot(0, self._automatic_mining_tick)
 
     def disable_background_auto(self) -> None:
-        session_ids = {
-            session.session_id for session in self._scope_sessions()
-        }
-        self._automatic_mining_session_ids.difference_update(session_ids)
-        stopped = self._stop_auto_started_sessions(session_ids)
-        self._update_global_run_controls()
-        logging.getLogger(__name__).info(
-            "后台自动挂机已停止；同时停止 %s 个由后台自动启动的挂机，"
-            "手动启动的挂机保持运行",
-            stopped,
+        self._stop_continuous_scope(
+            self._scope_sessions(),
+            disable_monitoring=True,
         )
+        self._update_global_run_controls()
 
     def _stop_auto_started_sessions(self, session_ids: set[str]) -> int:
         stopped = 0
@@ -1416,13 +1674,168 @@ class MinerGUI(QMainWindow):
             session = self._account_sessions.get(session_id)
             if (
                 session is None
-                or not session.auto_started_runtime
+                or session.run_owner != RunOwner.AUTO
                 or not session.controller.is_running
             ):
                 continue
             self._stop_account_session(session)
             stopped += 1
         return stopped
+
+    @staticmethod
+    def _automatic_start_uses_steady_sessions(
+        session: AccountWorkspace,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        started_at = session.automatic_guard_started_at
+        if started_at is None:
+            return False
+        current = monotonic() if now is None else now
+        return current - started_at >= AUTOMATIC_STEADY_GUARD_SECONDS
+
+    def boost_concurrency_scope(self) -> None:
+        self._capture_active_session()
+        sessions = self._boostable_scope_sessions()
+        if not sessions:
+            self._show_warning(
+                "没有可加速账号",
+                "请先扫码登录账号，再选择仅本次加速或持续高并发。",
+            )
+            return
+        fixed_high = tuple(
+            session
+            for session in sessions
+            if session.concurrency_mode == "fixed"
+            and session.thread_count >= PERSISTENT_HIGH_SESSIONS
+        )
+        choice = self._choose_concurrency_boost_mode(
+            len(sessions),
+            existing_fixed_high=bool(fixed_high),
+        )
+        if choice is None:
+            return
+
+        logger = logging.getLogger(__name__)
+        running_applied = 0
+        if choice == "once":
+            for session in sessions:
+                session.runtime_concurrency_override = (
+                    ONE_TIME_BOOST_SESSIONS
+                )
+                if session.controller.is_running and (
+                    session.controller.force_fixed_sessions_per_room(
+                        ONE_TIME_BOOST_SESSIONS
+                    )
+                ):
+                    running_applied += 1
+            logger.warning(
+                "已为 %s 个账号设置仅本次 100 线程加速；"
+                "其中 %s 个正在运行的账号已立即生效",
+                len(sessions),
+                running_applied,
+            )
+            self._show_info(
+                "仅本次加速已设置",
+                (
+                    f"已对 {len(sessions)} 个账号强制本次使用每房间 100 线程。\n"
+                    "正在挂机的账号立即生效；尚未挂机的账号会在下一次开始时生效。\n"
+                    "停止本次挂机后会恢复原来的自动/固定并发设置。\n"
+                    "线程过多可能触发 B 站风控，导致观看进度不计时。"
+                ),
+            )
+        else:
+            for session in sessions:
+                session.runtime_concurrency_override = None
+                session.concurrency_mode = "fixed"
+                session.thread_count = PERSISTENT_HIGH_SESSIONS
+                if session.controller.is_running and (
+                    session.controller.force_fixed_sessions_per_room(
+                        PERSISTENT_HIGH_SESSIONS
+                    )
+                ):
+                    running_applied += 1
+            self.threads_spin.setValue(PERSISTENT_HIGH_SESSIONS)
+            mode_index = self.concurrency_mode_combo.findData("fixed")
+            self.concurrency_mode_combo.setCurrentIndex(max(0, mode_index))
+            account_saved = self._persist_account_settings_for(sessions)
+            saved = self._persist_fixed_concurrency_setting() and account_saved
+            logger.warning(
+                "已将 %s 个账号切换为固定 32 线程；"
+                "其中 %s 个正在运行的账号已立即生效",
+                len(sessions),
+                running_applied,
+            )
+            self._show_info(
+                "已切换为持续高并发",
+                (
+                    f"已将 {len(sessions)} 个账号切换为固定 32 线程"
+                    f"{'并保存' if saved else '；但本次未能保存设置'}。\n"
+                    "如需恢复，请打开“设置与日志”，在高级设置中把并发模式改回“自动调节”。"
+                ),
+            )
+        self._update_global_run_controls()
+
+    def _persist_account_settings_for(
+        self,
+        sessions: tuple[AccountWorkspace, ...],
+    ) -> bool:
+        saved_sessions = [session for session in sessions if not session.temporary]
+        if not saved_sessions:
+            return True
+        if not self._backup_cookie_profiles("settings"):
+            return False
+        previous_flags = {
+            session.session_id: session.account_settings_saved
+            for session in saved_sessions
+        }
+        previous_profile_settings = [
+            (profile, dict(profile.settings))
+            for profile in self._cookie_profiles
+        ]
+        try:
+            for session in saved_sessions:
+                session.account_settings_saved = True
+            self._write_cookie_profiles()
+            return True
+        except Exception as exc:
+            for session in saved_sessions:
+                session.account_settings_saved = previous_flags[
+                    session.session_id
+                ]
+            for profile, settings in previous_profile_settings:
+                profile.settings = settings
+            logging.getLogger(__name__).warning(
+                "账号设置保存失败: %s",
+                exc,
+            )
+            return False
+
+    def _choose_concurrency_boost_mode(
+        self,
+        account_count: int,
+        *,
+        existing_fixed_high: bool = False,
+    ) -> str | None:
+        return choose_concurrency_boost_mode(
+            self,
+            account_count,
+            existing_fixed_high=existing_fixed_high,
+        )
+
+    def _persist_fixed_concurrency_setting(self) -> bool:
+        try:
+            payload = load_stored_config_data(self._credential_store) or {}
+            payload["thread_count"] = PERSISTENT_HIGH_SESSIONS
+            payload["concurrency_mode"] = "fixed"
+            save_stored_config_data(self._credential_store, payload)
+            return True
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "固定 32 线程已在本次运行中生效，但保存设置失败: %s",
+                exc,
+            )
+            return False
 
     @staticmethod
     def _seed_session_runtime_config(
@@ -1476,13 +1889,21 @@ class MinerGUI(QMainWindow):
                 session.next_automatic_check_at = now_epoch + 15 * 60
                 continue
             session.automatic_check_inflight = True
+            session.automation_state = AutomationState.CHECKING
             session_id = session.session_id
             cookie = session.cookie
             room_id = room_ids[0]
             runtime_running = session.controller.is_running
+            generation = session.configuration_generation
             threading.Thread(
                 target=self._run_automatic_account_check,
-                args=(session_id, cookie, room_id, runtime_running),
+                args=(
+                    session_id,
+                    generation,
+                    cookie,
+                    room_id,
+                    runtime_running,
+                ),
                 daemon=True,
                 name=f"auto-mining-check-{session.uid or 'unknown'}",
             ).start()
@@ -1490,6 +1911,7 @@ class MinerGUI(QMainWindow):
     def _run_automatic_account_check(
         self,
         session_id: str,
+        generation: int,
         cookie: str,
         room_id: int,
         runtime_running: bool,
@@ -1511,12 +1933,14 @@ class MinerGUI(QMainWindow):
                 result = AutomaticAccountCheckResult(
                     session_id=session_id,
                     selection=selection,
+                    generation=generation,
                     error=discovery.message or "未发现可调度任务",
                 )
             elif selection.phase == "future":
                 result = AutomaticAccountCheckResult(
                     session_id=session_id,
                     selection=selection,
+                    generation=generation,
                 )
             else:
 
@@ -1563,10 +1987,36 @@ class MinerGUI(QMainWindow):
                     finally:
                         await client.close()
 
-                progresses, live_status = asyncio.run(_query_current())
+                session = self._account_sessions.get(session_id)
+                if session is None:
+                    raise RuntimeError("账号工作区已关闭")
+                permit = session.request_coordinator.acquire(
+                    "automatic-task-check",
+                    group=TASK_API_GROUP,
+                    timeout_seconds=10.0,
+                )
+                if permit is None:
+                    raise RuntimeError("账号任务请求正在执行或冷却中")
+                query_error: BaseException | None = None
+                try:
+                    progresses, live_status = asyncio.run(_query_current())
+                except BaseException as exc:
+                    query_error = exc
+                    raise
+                finally:
+                    session.request_coordinator.finish(
+                        permit,
+                        cooldown_seconds=(
+                            30.0
+                            if query_error is not None
+                            and looks_rate_limited(query_error)
+                            else 0.0
+                        ),
+                    )
                 result = AutomaticAccountCheckResult(
                     session_id=session_id,
                     selection=selection,
+                    generation=generation,
                     snapshot=TaskSnapshot(progresses=tuple(progresses)),
                     live_status=live_status,
                 )
@@ -1578,6 +2028,7 @@ class MinerGUI(QMainWindow):
                     "none",
                     15 * 60,
                 ),
+                generation=generation,
                 error=str(exc).strip() or type(exc).__name__,
             )
         self._post_ui_task(self._apply_automatic_account_check, result)
@@ -1590,6 +2041,18 @@ class MinerGUI(QMainWindow):
         if session is None:
             return
         session.automatic_check_inflight = False
+        if result.generation != session.configuration_generation:
+            session.automation_state = AutomationState.ARMED
+            if session.session_id in self._automatic_mining_session_ids:
+                session.next_automatic_check_at = 0.0
+                QTimer.singleShot(0, self._automatic_mining_tick)
+            logging.getLogger(__name__).info(
+                "账号 UID %s 的旧后台检查结果已忽略（generation %s -> %s）",
+                session.uid or "未知",
+                result.generation,
+                session.configuration_generation,
+            )
+            return
         if session.automatic_check_pending:
             session.automatic_check_pending = False
             session.next_automatic_check_at = 0.0
@@ -1599,6 +2062,7 @@ class MinerGUI(QMainWindow):
             time() + result.selection.next_check_seconds
         )
         if session.session_id not in self._automatic_mining_session_ids:
+            session.automation_state = AutomationState.OFF
             return
         group = result.selection.group
         known_task_expired = (
@@ -1608,7 +2072,11 @@ class MinerGUI(QMainWindow):
         if result.selection.phase == "expired" or (
             result.error and known_task_expired
         ):
-            if session.controller.is_running and session.auto_started_runtime:
+            session.task_phase = TaskPhase.EXPIRED
+            if (
+                session.controller.is_running
+                and session.run_owner == RunOwner.AUTO
+            ):
                 self._stop_account_session(session)
             session.task_ids_text = ""
             session.task_started_at = None
@@ -1620,7 +2088,7 @@ class MinerGUI(QMainWindow):
                 self.task_ids_edit.clear()
                 self._render_task_snapshot(session.latest_task_snapshot)
             session.discovery_status_text = (
-                "后台自动挂机：旧任务已结束，已清除旧进度；"
+                "持续任务检测：旧任务已结束，已清除旧进度；"
                 "15 分钟后重新识别当天任务"
             )
             if session.session_id == self._active_session_id:
@@ -1629,8 +2097,10 @@ class MinerGUI(QMainWindow):
                     False,
                 )
             self._update_global_run_controls()
+            session.automation_state = AutomationState.ARMED
             return
         if result.error:
+            session.automation_state = AutomationState.COOLDOWN
             session.discovery_status_text = (
                 f"后台自动检查未完成：{result.error}"
             )
@@ -1657,7 +2127,12 @@ class MinerGUI(QMainWindow):
             self.task_ids_edit.setText(session.task_ids_text)
 
         if result.selection.phase == "future":
-            if session.controller.is_running:
+            session.task_phase = TaskPhase.FUTURE
+            session.automation_state = AutomationState.WAITING_TASK
+            if (
+                session.controller.is_running
+                and session.run_owner == RunOwner.AUTO
+            ):
                 self._stop_account_session(session)
             start_text = (
                 group.start_at.astimezone().strftime("%m-%d %H:%M")
@@ -1665,7 +2140,7 @@ class MinerGUI(QMainWindow):
                 else "稍后"
             )
             session.discovery_status_text = (
-                f"后台自动挂机：已识别 {group.label}，预计 {start_text} 开始；"
+                f"持续任务检测：已识别 {group.label}，预计 {start_text} 开始；"
                 "到时自动检查开播"
             )
             if session.session_id == self._active_session_id:
@@ -1676,51 +2151,60 @@ class MinerGUI(QMainWindow):
             return
 
         session.latest_task_snapshot = result.snapshot
+        session.task_phase = TaskPhase.ACTIVE
         if session.cookie:
             session.login_state = LoginState.VALID
         if session.session_id == self._active_session_id:
             self._render_task_snapshot(result.snapshot)
         if all_tasks_completed(result.snapshot):
-            if session.controller.is_running:
-                claim_ids = claimable_reward_task_ids(result.snapshot)
-                claim_future = session.controller.claim_reward_task_ids(
-                    claim_ids
-                )
-                if claim_future is not None:
-                    session.discovery_status_text = (
-                        "后台自动挂机：当天任务已全部完成，"
-                        "正在确认最后可领取奖励"
-                    )
-                    threading.Thread(
-                        target=self._finish_completed_auto_session,
-                        args=(session.session_id, claim_future),
-                        daemon=True,
-                        name=f"auto-final-claim-{session.uid or 'unknown'}",
-                    ).start()
-                    if session.session_id == self._active_session_id:
-                        self._set_discovery_status(
-                            session.discovery_status_text,
-                            False,
-                        )
-                    return
-                self._stop_account_session(session)
-            session.discovery_status_text = (
-                "后台自动挂机：当天任务已全部完成，心跳已停止；"
-                "仍会每 15 分钟守候新任务"
+            session.task_phase = TaskPhase.COMPLETED
+            claim_ids = claimable_reward_task_ids(result.snapshot)
+            session.automation_state = (
+                AutomationState.CLAIMING
+                if session.controller.is_running
+                else AutomationState.ARMED
             )
+            if all_task_rewards_claimed(result.snapshot):
+                session.discovery_status_text = (
+                    "平台已确认当天奖励全部领取，正在结束观看线程；"
+                    "后台任务检测继续运行"
+                    if session.controller.is_running
+                    else "当天任务奖励已全部领取，后台任务检测继续运行"
+                )
+            elif claim_ids and session.controller.is_running:
+                session.discovery_status_text = (
+                    "当天任务已全部完成，正在自动领取并确认最后奖励；"
+                    "确认全部领取后关闭观看线程，后台检测继续运行"
+                )
+            else:
+                session.discovery_status_text = (
+                    "当天任务已完成，等待平台确认领奖状态；"
+                    "确认全部领取后关闭观看线程，后台检测继续运行"
+                    if session.controller.is_running
+                    else "当天任务已完成，后台检测继续运行"
+                )
         elif result.live_status == 1:
             if not session.controller.is_running:
                 self._start_account_session(
                     session,
                     interactive=False,
                     automatic=True,
+                    automatic_start_in_steady_mode=(
+                        self._automatic_start_uses_steady_sessions(session)
+                    ),
                 )
+            session.automation_state = (
+                AutomationState.AUTO_RUNNING
+                if session.run_owner == RunOwner.AUTO
+                else AutomationState.ARMED
+            )
             session.discovery_status_text = (
-                f"后台自动挂机：{group.label} 已开始且直播已开播，正在挂机"
+                f"持续任务检测：{group.label} 已开始且直播已开播，正在挂机"
             )
         else:
+            session.automation_state = AutomationState.WAITING_LIVE
             session.discovery_status_text = (
-                f"后台自动挂机：{group.label} 尚未开播；"
+                f"持续任务检测：{group.label} 尚未开播；"
                 "15 分钟后自动复查"
             )
         if session.session_id == self._active_session_id:
@@ -1729,41 +2213,6 @@ class MinerGUI(QMainWindow):
                 False,
             )
         self._update_global_run_controls()
-
-    def _finish_completed_auto_session(
-        self,
-        session_id: str,
-        claim_future,
-    ) -> None:
-        try:
-            claim_future.result(timeout=120)
-        except Exception as exc:
-            logging.getLogger(__name__).warning(
-                "账号最终奖励确认未完成，将在下次轮询重试: %s",
-                exc,
-            )
-        self._post_ui_task(
-            self._stop_after_completed_auto_claim,
-            session_id,
-        )
-
-    def _stop_after_completed_auto_claim(self, session_id: str) -> None:
-        session = self._account_sessions.get(session_id)
-        if session is None:
-            return
-        if session_id not in self._automatic_mining_session_ids:
-            return
-        if session.controller.is_running:
-            self._stop_account_session(session)
-        session.discovery_status_text = (
-            "后台自动挂机：当天任务已全部完成，心跳已停止；"
-            "仍会每 15 分钟守候新任务"
-        )
-        if session_id == self._active_session_id:
-            self._set_discovery_status(
-                session.discovery_status_text,
-                False,
-            )
 
     def _update_global_run_controls(self) -> None:
         if not hasattr(self, "apply_all_switch"):
@@ -1789,30 +2238,24 @@ class MinerGUI(QMainWindow):
         self.start_btn.setEnabled(
             not action_blocked and (any_running or any_startable)
         )
+        self.boost_concurrency_btn.setEnabled(
+            not action_blocked and bool(self._boostable_scope_sessions())
+        )
         auto_enabled = any(
             session.session_id in self._automatic_mining_session_ids
             for session in sessions
-        )
-        self.enable_auto_btn.setText(
-            "停止后台自动" if auto_enabled else "后台自动挂机"
-        )
-        self._set_action_button_color(
-            self.enable_auto_btn,
-            "red" if auto_enabled else "blue",
         )
         scope_text = (
             "所有账号" if self.apply_all_switch.isChecked() else "当前账号"
         )
         self.auto_mining_description.setText(
             (
-                f"作用范围：{scope_text}。后台自动挂机已开启；定时检查任务，"
-                "开播后自动启动，完成领奖后停止心跳并继续守候；"
-                "停止后台自动会结束由它启动的挂机；重新打开程序后默认关闭。"
+                f"作用范围：{scope_text}。后台任务检测已开启并会保持到程序退出；"
+                "全部领奖后自动关闭观看线程，发现新任务后再启动。"
                 if auto_enabled
                 else
-                f"作用范围：{scope_text}。后台自动挂机会定时检查任务，"
-                "开播后自动启动，完成领奖后停止心跳并继续守候；"
-                "手动启动的挂机不受它的停止操作影响；每次打开程序后需要手动开启。"
+                f"作用范围：{scope_text}。点击开始会同时启动观看线程和后台任务检测；"
+                "后台检测会保持到程序退出。"
             )
         )
 
@@ -1834,6 +2277,7 @@ class MinerGUI(QMainWindow):
         for session in targets:
             if session.session_id not in self._automatic_mining_session_ids:
                 continue
+            session.automatic_guard_started_at = monotonic()
             session.next_automatic_check_at = 0.0
             if session.automatic_check_inflight:
                 session.automatic_check_pending = True
@@ -1857,7 +2301,8 @@ class MinerGUI(QMainWindow):
                 continue
             session.application_state = ApplicationState.IDLE
             session.runtime_health = RuntimeHealth()
-            session.auto_started_runtime = False
+            session.run_owner = RunOwner.NONE
+            session.runtime_concurrency_override = None
             if session.session_id == self._active_session_id:
                 self._render_runtime_health(session.runtime_health)
             else:
@@ -1943,6 +2388,61 @@ class MinerGUI(QMainWindow):
         if session_id == self._active_session_id:
             self._task_progress_pending = False
             self._render_task_snapshot(snapshot)
+
+    def _stop_runtime_after_rewards_claimed(
+        self,
+        session_id: str,
+        settled_task_ids: tuple[str, ...],
+    ) -> None:
+        session = self._account_sessions.get(session_id)
+        if (
+            session is None
+            or not session.controller.is_running
+            or session.controller.stop_signal_set
+        ):
+            return
+        current_task_ids = tuple(parse_task_ids(session.task_ids_text))
+        if set(current_task_ids) != set(settled_task_ids):
+            logging.getLogger(__name__).info(
+                "账号 UID %s 的旧任务完成信号已忽略: %s -> %s",
+                session.uid or "未知",
+                settled_task_ids,
+                current_task_ids,
+            )
+            return
+        if session.completion_auto_stop_bypass:
+            session.discovery_status_text = (
+                "当天奖励显示已全部领取；本次属于手动继续挂机，"
+                "不会自动暂停，请手动停止"
+            )
+            if session_id == self._active_session_id:
+                self._set_discovery_status(
+                    session.discovery_status_text,
+                    False,
+                )
+            return
+        completion_key = self._completion_run_key(
+            current_task_ids
+        )
+        if completion_key is None:
+            return
+        session.completion_auto_stop_key = completion_key
+        session.automation_state = AutomationState.ARMED
+        session.discovery_status_text = (
+            "当天任务奖励已全部领取，观看线程已自动关闭；"
+            "后台任务检测继续运行，发现新任务后会自动启动"
+        )
+        logging.getLogger(__name__).info(
+            "账号 UID %s 当天奖励已全部领取，正在关闭观看线程并保留后台检测",
+            session.uid or "未知",
+        )
+        if session_id == self._active_session_id:
+            self._set_discovery_status(
+                session.discovery_status_text,
+                False,
+            )
+        self._stop_account_session(session)
+
 
     def _apply_task_snapshot(self, snapshot: TaskSnapshot) -> None:
         self._active_session.latest_task_snapshot = snapshot
@@ -2045,6 +2545,12 @@ class MinerGUI(QMainWindow):
 
     def _render_runtime_health(self, health: RuntimeHealth) -> None:
         self._set_application_state(health.state)
+        owner = self._active_session.run_owner
+        owner_label = {
+            RunOwner.NONE: "未启动",
+            RunOwner.MANUAL: "手动运行",
+            RunOwner.AUTO: "后台自动运行",
+        }[owner]
         heartbeat = "等待首次心跳"
         if health.last_heartbeat_at:
             age = max(0, int(time() - health.last_heartbeat_at))
@@ -2060,7 +2566,7 @@ class MinerGUI(QMainWindow):
         else:
             phase_label = "固定并发"
         detail = (
-            f"会话 当前 {health.active_sessions} / 目标 {health.target_sessions}"
+            f"{owner_label} · 会话 当前 {health.active_sessions} / 目标 {health.target_sessions}"
             f" · {phase_label} · 重连 {health.reconnect_count} · {heartbeat}"
         )
         if health.concurrency_detail:
@@ -2254,12 +2760,18 @@ class MinerGUI(QMainWindow):
         return BrowserActions.extract_room_id_from_live_url(text)
 
     def _apply_auto_room_id(self, room_id: int) -> None:
+        changed = self._active_session.rooms_text != str(room_id)
         self.rooms_edit.setText(str(room_id))
         self._active_session.rooms_text = str(room_id)
+        if changed:
+            self._active_session.bump_configuration_generation()
         self._on_runtime_inputs_changed()
 
     def _apply_auto_cookie(self, cookie_str: str) -> AccountWorkspace:
+        previous_cookie = self._active_session.cookie
         session = self._adopt_cookie_for_active_session(cookie_str)
+        if session.cookie != previous_cookie:
+            session.bump_configuration_generation()
         session.login_check_generation += 1
         session.login_state = LoginState.UNKNOWN
         self.cookie_edit.setText(cookie_str)
@@ -2281,6 +2793,7 @@ class MinerGUI(QMainWindow):
             session.pending_start_after_discovery = False
             session.rediscovery_attempted_for_run = False
             if tasks_changed:
+                session.bump_configuration_generation()
                 session.latest_task_snapshot = TaskSnapshot()
                 session.task_progress_result = ""
                 session.task_progress_pending = False
@@ -2389,17 +2902,25 @@ class MinerGUI(QMainWindow):
                 return
 
             if session is None:
-                session = self._register_account_session(
-                    AccountWorkspace.saved_account(
-                        credential_id=profile.credential_id,
-                        cookie=cookie,
-                        remark=profile.remark,
-                    )
+                session = AccountWorkspace.saved_account(
+                    credential_id=profile.credential_id,
+                    cookie=cookie,
+                    remark=profile.remark,
                 )
+                account_settings = AccountSettings.from_mapping(
+                    profile.settings
+                )
+                if account_settings is not None:
+                    self._apply_account_settings(session, account_settings)
+                    session.account_settings_saved = True
+                session = self._register_account_session(session)
+            cookie_changed = session.cookie != cookie
             session.cookie = cookie
             session.remark = profile.remark
             session.login_check_generation += 1
             session.login_state = LoginState.VALID
+            if cookie_changed:
+                session.bump_configuration_generation()
             self._activate_account_session(session.session_id)
             self.cookie_edit.setText(cookie)
             self.cookie_remark_edit.setText(profile.remark)
@@ -2561,33 +3082,49 @@ class MinerGUI(QMainWindow):
         *,
         preserve_account_fields: bool = False,
     ) -> None:
-        self.rooms_edit.setText(values.rooms_text)
-        self.threads_spin.setValue(int(values.thread_count_text))
-        self.reconnect_spin.setValue(int(values.reconnect_delay_text))
-        self.task_ids_edit.setText(values.task_ids_text)
-        self.task_interval_spin.setValue(int(values.task_query_interval_text))
+        del preserve_account_fields
+        self._global_account_defaults = AccountSettings(
+            rooms_text=values.rooms_text,
+            thread_count=int(values.thread_count_text),
+            reconnect_delay_seconds=int(values.reconnect_delay_text),
+            task_query_interval_seconds=int(
+                values.task_query_interval_text
+            ),
+            notify_on_task_complete=values.notify_on_task_complete,
+            concurrency_mode=values.concurrency_mode,
+        )
+        for session in self._account_sessions.values():
+            if not session.account_settings_saved and not session.controller.is_running:
+                self._apply_account_settings(
+                    session,
+                    self._global_account_defaults,
+                )
         self.notify_urls_edit.setText(
             values.notify_urls_text
             or self._credential_store.get("notification-urls")
         )
-        self.disable_task_notify_check.setChecked(
-            not values.notify_on_task_complete
-        )
         self.verbose_check.setChecked(values.verbose)
-        mode_index = self.concurrency_mode_combo.findData(
-            values.concurrency_mode
-        )
-        self.concurrency_mode_combo.setCurrentIndex(max(0, mode_index))
         self.minimize_to_tray_check.setChecked(values.minimize_to_tray)
         self.close_to_tray_check.setChecked(values.close_to_tray)
         self.auto_check_updates_check.setChecked(values.auto_check_updates)
         self.apply_all_switch.setChecked(values.apply_to_all_accounts)
-        # 后台自动挂机属于当前运行会话，不从设置恢复。这样重新打开程序
-        # 只会加载账号和普通参数，不会在用户未点击按钮时自动启动挂机。
+        enabled_ids = set(self._automatic_mining_session_ids)
         self._automatic_mining_session_ids.clear()
-        self._capture_active_session(
-            preserve_account_fields=preserve_account_fields
-        )
+        for session_id in enabled_ids:
+            session = self._account_sessions.get(session_id)
+            if session is not None:
+                session.automatic_guard_started_at = None
+                session.automation_state = AutomationState.OFF
+        stopped = self._stop_auto_started_sessions(enabled_ids)
+        if enabled_ids:
+            logging.getLogger(__name__).info(
+                "加载设置已关闭持续任务检测；停止 %s 个自动运行，手动运行保持",
+                stopped,
+            )
+        # 当前任务属于运行时数据；即使旧设置里有 task_ids 也不再恢复，
+        # 避免第二天加载已经过期的任务。
+        if hasattr(self, "_task_refresh_timer"):
+            self._restore_active_session()
         self._refresh_cookie_profile_combo()
         self._update_global_run_controls()
 
@@ -2624,6 +3161,7 @@ class MinerGUI(QMainWindow):
     def save_config(self) -> None:
         try:
             config = self._build_config()
+            target_sessions = self._scope_sessions()
             self._store_current_secrets()
             save_stored_config_data(
                 self._credential_store,
@@ -2635,13 +3173,15 @@ class MinerGUI(QMainWindow):
                     auto_check_updates=(
                         self.auto_check_updates_check.isChecked()
                     ),
-                    # 后台自动挂机仅在当前运行中有效，不能成为启动项。
+                    # 持续任务检测仅在当前运行中有效，不能成为启动项。
                     automatic_mining_enabled=False,
                     apply_to_all_accounts=self.apply_all_switch.isChecked(),
                 ),
             )
+            if not self._persist_account_settings_for(target_sessions):
+                raise OSError("账号级设置保存失败")
             logging.getLogger(__name__).info(
-                "设置已保存到统一凭据文件: %s",
+                "全局默认与账号设置已保存到统一凭据文件: %s",
                 cookie_store_path(),
             )
         except Exception as exc:

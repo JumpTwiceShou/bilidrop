@@ -7,7 +7,7 @@ import shutil
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,7 @@ class CookieProfile:
     cookie: str
     updated_at: str = ""
     credential_id: str = ""
+    settings: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -112,6 +113,11 @@ def _state_from_payload(
                 cookie=cookie,
                 updated_at=str(raw.get("updated_at", "")).strip(),
                 credential_id=credential_id,
+                settings=(
+                    dict(raw.get("settings", {}))
+                    if isinstance(raw.get("settings"), dict)
+                    else {}
+                ),
             )
         )
 
@@ -166,6 +172,11 @@ def _profile_signature(state: CookieProfileState) -> tuple:
                 profile.remark,
                 profile.updated_at,
                 profile.cookie,
+                json.dumps(
+                    profile.settings,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
             )
             for profile in state.profiles
         ),
@@ -262,6 +273,11 @@ def save_cookie_profiles(
                 "remark": profile.remark,
                 "credential_id": credential_id,
                 "updated_at": profile.updated_at,
+                **(
+                    {"settings": dict(profile.settings)}
+                    if profile.settings
+                    else {}
+                ),
             }
         )
 
@@ -272,7 +288,7 @@ def save_cookie_profiles(
         else ""
     )
     expected = {
-        "version": 4,
+        "version": 5,
         "last_selected_credential_id": selected_id,
         "accounts": accounts,
     }

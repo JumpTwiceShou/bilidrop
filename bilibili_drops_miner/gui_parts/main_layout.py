@@ -57,7 +57,7 @@ class MainWindowCallbacks:
     auto_fetch_task_ids: Callable[..., None]
     auto_fetch_overwatch_esports: Callable[..., None]
     toggle_run: Callable[..., None]
-    toggle_background_auto: Callable[..., None]
+    boost_concurrency: Callable[..., None]
     load_config: Callable[..., None]
     save_config: Callable[..., None]
     select_cookie_profile: Callable[..., None]
@@ -94,7 +94,7 @@ class MainWindowWidgets:
     settings_button: QPushButton
     claim_rewards_btn: QPushButton
     start_btn: QPushButton
-    enable_auto_btn: QPushButton
+    boost_concurrency_btn: QPushButton
     apply_all_switch: ToggleSwitch
     auto_mining_description: QLabel
     concurrency_mode_combo: QComboBox
@@ -304,20 +304,25 @@ def build_main_window_layout(
     action_row = QHBoxLayout()
     action_row.setSpacing(10)
     start_btn = _button("开始", "green", callbacks.toggle_run)
-    start_btn.setMinimumWidth(170)
-    enable_auto_btn = _button(
-        "后台自动挂机", "blue", callbacks.toggle_background_auto
+    start_btn.setMinimumWidth(150)
+    boost_concurrency_btn = _button(
+        "加速执行（本次 100 线程）",
+        "gray",
+        callbacks.boost_concurrency,
     )
-    enable_auto_btn.setMinimumWidth(190)
+    boost_concurrency_btn.setMinimumWidth(190)
+    boost_concurrency_btn.setToolTip(
+        "仅本次强制 100 线程；持续模式仍保存为固定 32，可在高级设置修改"
+    )
     action_row.addWidget(start_btn)
-    action_row.addWidget(enable_auto_btn)
+    action_row.addWidget(boost_concurrency_btn)
     action_row.addStretch(1)
     scope_label = QLabel("应用到所有账号")
     scope_label.setStyleSheet("color:#c7ced9;")
     apply_all_switch = ToggleSwitch()
     apply_all_switch.setAccessibleName("应用到所有账号")
     apply_all_switch.setToolTip(
-        "开启后，识别任务、“开始/停止”和“后台自动挂机”都会应用到所有账号；"
+        "开启后，识别任务和“开始/停止”都会应用到所有账号；"
         "每个账号仍独立查询自己的进度"
     )
     scope_label.setBuddy(apply_all_switch)
@@ -325,8 +330,8 @@ def build_main_window_layout(
     action_row.addWidget(apply_all_switch)
     runtime_header.addLayout(action_row)
     auto_mining_description = QLabel(
-        "当前只操作所选账号。后台自动挂机会定时检查任务，开播后自动启动，"
-        "完成领奖后停止心跳并继续守候；每次打开程序后需要手动开启。"
+        "当前只操作所选账号。开始后启动观看线程和后台任务检测；"
+        "停止只关闭观看线程，后台检测保留到程序退出。"
     )
     auto_mining_description.setWordWrap(True)
     auto_mining_description.setStyleSheet("color:#8f9bad;font-size:9pt;")
@@ -535,7 +540,7 @@ def build_main_window_layout(
         settings_button=settings_button,
         claim_rewards_btn=claim_rewards_btn,
         start_btn=start_btn,
-        enable_auto_btn=enable_auto_btn,
+        boost_concurrency_btn=boost_concurrency_btn,
         apply_all_switch=apply_all_switch,
         auto_mining_description=auto_mining_description,
         concurrency_mode_combo=concurrency_mode_combo,

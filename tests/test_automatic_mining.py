@@ -2,6 +2,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from bilibili_drops_miner.automatic_mining import (
+    all_task_rewards_claimed,
     all_tasks_completed,
     claimable_reward_task_ids,
     select_scheduled_task_group,
@@ -115,3 +116,8 @@ def test_all_reward_nodes_must_be_complete_before_stopping_heartbeats() -> None:
         "180",
         "240",
     ]
+    assert not all_task_rewards_claimed(TaskSnapshot(progresses=(task,)))
+
+    for point in task.check_points:
+        point.status = 3
+    assert all_task_rewards_claimed(TaskSnapshot(progresses=(task,)))

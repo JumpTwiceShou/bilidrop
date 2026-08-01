@@ -20,6 +20,7 @@ class ScheduledTaskSelection:
 class AutomaticAccountCheckResult:
     session_id: str
     selection: ScheduledTaskSelection
+    generation: int = 0
     snapshot: TaskSnapshot = field(default_factory=TaskSnapshot)
     live_status: int | None = None
     error: str = ""
@@ -86,6 +87,19 @@ def all_tasks_completed(snapshot: TaskSnapshot) -> bool:
             if not all(point.is_completed for point in checkpoints):
                 return False
         elif not task.is_completed:
+            return False
+    return True
+
+
+def all_task_rewards_claimed(snapshot: TaskSnapshot) -> bool:
+    if snapshot.error or not snapshot.progresses:
+        return False
+    for task in snapshot.progresses:
+        checkpoints = list(task.check_points or [])
+        if checkpoints:
+            if not all(point.is_claimed for point in checkpoints):
+                return False
+        elif not task.is_claimed:
             return False
     return True
 

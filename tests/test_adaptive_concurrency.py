@@ -1,5 +1,3 @@
-from datetime import datetime, timedelta, timezone
-
 from bilibili_drops_miner.adaptive_concurrency import (
     AdaptiveConcurrencyController,
 )
@@ -33,9 +31,9 @@ def _snapshot(minutes: float, task_id: str = "daily") -> TaskSnapshot:
     )
 
 
-def test_detected_task_waits_for_initial_progress_before_catchup() -> None:
+def test_guarded_task_waits_for_initial_progress_before_catchup() -> None:
     controller = AdaptiveConcurrencyController(
-        task_started_at=datetime.now(timezone.utc) - timedelta(minutes=20)
+        start_in_steady_mode=True
     )
     assert controller.target_sessions == 2
     assert controller.observe(_snapshot(20), observed_at=0) == 16
@@ -43,14 +41,13 @@ def test_detected_task_waits_for_initial_progress_before_catchup() -> None:
 
 def test_just_started_task_can_begin_with_two_sessions() -> None:
     controller = AdaptiveConcurrencyController(
-        task_started_at=datetime.now(timezone.utc)
+        start_in_steady_mode=True
     )
     assert controller.target_sessions == 2
 
 
 def test_manual_start_drops_to_two_when_three_minute_gain_is_below_16() -> None:
     controller = AdaptiveConcurrencyController(
-        task_started_at=None,
         sample_window_seconds=180,
         minimum_progress_delta=16,
     )
@@ -64,7 +61,6 @@ def test_manual_start_drops_to_two_when_three_minute_gain_is_below_16() -> None:
 
 def test_gain_of_16_keeps_catchup_and_starts_another_three_minute_round() -> None:
     controller = AdaptiveConcurrencyController(
-        task_started_at=None,
         sample_window_seconds=180,
         minimum_progress_delta=16,
     )
@@ -78,7 +74,6 @@ def test_gain_of_16_keeps_catchup_and_starts_another_three_minute_round() -> Non
 
 def test_settled_task_stays_at_two_until_task_signature_changes() -> None:
     controller = AdaptiveConcurrencyController(
-        task_started_at=None,
         sample_window_seconds=180,
     )
 
@@ -93,9 +88,21 @@ def test_settled_task_stays_at_two_until_task_signature_changes() -> None:
     assert not controller.settled
 
 
+def test_task_id_change_inside_existing_runtime_gets_catchup_trial() -> None:
+    controller = AdaptiveConcurrencyController(sample_window_seconds=180)
+    controller.observe(_snapshot(100), observed_at=0)
+    controller.observe(_snapshot(110), observed_at=180)
+
+    assert controller.observe(
+        _snapshot(0, task_id="next-day"),
+        observed_at=360,
+    ) == 16
+    assert not controller.settled
+
+
 def test_detected_new_task_with_zero_progress_uses_two_immediately() -> None:
     controller = AdaptiveConcurrencyController(
-        task_started_at=datetime.now(timezone.utc),
+        start_in_steady_mode=True,
         sample_window_seconds=180,
     )
 
@@ -106,7 +113,6 @@ def test_detected_new_task_with_zero_progress_uses_two_immediately() -> None:
 
 def test_manual_new_task_with_zero_progress_still_gets_three_minute_trial() -> None:
     controller = AdaptiveConcurrencyController(
-        task_started_at=None,
         sample_window_seconds=180,
     )
 
@@ -117,7 +123,6 @@ def test_manual_new_task_with_zero_progress_still_gets_three_minute_trial() -> N
 
 def test_missing_progress_for_three_minutes_also_drops_to_two() -> None:
     controller = AdaptiveConcurrencyController(
-        task_started_at=None,
         sample_window_seconds=180,
     )
     empty = TaskSnapshot()

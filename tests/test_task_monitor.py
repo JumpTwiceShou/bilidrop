@@ -89,6 +89,41 @@ def test_account_monitor_polls_and_notifies_once() -> None:
     asyncio.run(scenario())
 
 
+def test_rewards_settled_callback_runs_once_after_completion_notification() -> None:
+    async def scenario() -> None:
+        client = FakeClient()
+        notifier = FakeNotifier()
+        callback_message_counts: list[int] = []
+        callback_event = asyncio.Event()
+
+        settled_task_ids: list[tuple[str, ...]] = []
+
+        def on_rewards_settled(task_ids: tuple[str, ...]) -> None:
+            callback_message_counts.append(notifier.calls)
+            settled_task_ids.append(task_ids)
+            callback_event.set()
+
+        monitor = AccountTaskMonitor(
+            client=client,
+            notifier=notifier,
+            config=MinerConfig("cookie", [1], task_ids=["a"]),
+            on_rewards_settled=on_rewards_settled,
+        )
+        task = asyncio.create_task(monitor.run())
+        await asyncio.wait_for(callback_event.wait(), timeout=1)
+        monitor.request_refresh()
+        while client.poll_count < 2:
+            await asyncio.sleep(0)
+        await monitor.stop()
+        await task
+
+        assert callback_message_counts == [1]
+        assert settled_task_ids == [("a",)]
+        assert client.reward_calls == [["a"]]
+
+    asyncio.run(scenario())
+
+
 def test_successful_claim_retry_sends_follow_up_status() -> None:
     class RetryClient(FakeClient):
         async def receive_all_mission_rewards(self, task_ids):

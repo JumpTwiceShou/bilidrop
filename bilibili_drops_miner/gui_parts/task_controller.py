@@ -12,6 +12,11 @@ from bilibili_drops_miner.gui_parts.task_presenter import (
     format_live_watch_time_progress,
     format_reward_claim_results,
 )
+from bilibili_drops_miner.request_coordinator import (
+    TASK_API_GROUP,
+    AccountRequestCoordinator,
+    looks_rate_limited,
+)
 
 
 class TaskController:
@@ -30,6 +35,7 @@ class TaskController:
         runtime_is_running: Callable[[], bool] | None = None,
         request_runtime_refresh: Callable[[], bool] | None = None,
         claim_runtime_rewards: Callable[[], Future | None] | None = None,
+        request_coordinator: AccountRequestCoordinator | None = None,
     ) -> None:
         self._get_cookie = get_cookie
         self._get_room_ids = get_room_ids
@@ -43,6 +49,9 @@ class TaskController:
         self._runtime_is_running = runtime_is_running or (lambda: False)
         self._request_runtime_refresh = request_runtime_refresh or (lambda: False)
         self._claim_runtime_rewards = claim_runtime_rewards or (lambda: None)
+        self._request_coordinator = (
+            request_coordinator or AccountRequestCoordinator()
+        )
         self._task_refresh_lock = threading.Lock()
         self._task_refresh_inflight = False
         self._task_refresh_queued = False
@@ -178,7 +187,15 @@ class TaskController:
         def _do() -> None:
             result_text = ""
             refresh_after = False
+            permit = self._request_coordinator.try_begin(
+                "task-refresh",
+                group=TASK_API_GROUP,
+            )
             try:
+                if permit is None:
+                    result_text = "账号任务请求正在执行或冷却中，稍后自动刷新"
+                    refresh_after = True
+                    return
 
                 async def _query():
                     client = BilibiliClient(cookie)
@@ -201,6 +218,11 @@ class TaskController:
                 logging.getLogger(__name__).warning("刷新任务失败: %s", exc)
                 result_text = f"刷新任务失败: {exc}"
             finally:
+                if permit is not None:
+                    self._request_coordinator.finish(
+                        permit,
+                        cooldown_seconds=(30.0 if looks_rate_limited(result_text) else 0.0),
+                    )
                 rerun = False
                 with self._task_refresh_lock:
                     self._task_refresh_inflight = False
@@ -231,8 +253,9 @@ class TaskController:
 
         def _do() -> None:
             result_text = ""
+            refresh_after = False
+            permit = None
             try:
-
                 runtime_future = (
                     self._claim_runtime_rewards()
                     if self._runtime_is_running()
@@ -242,6 +265,13 @@ class TaskController:
                     results = runtime_future.result(timeout=120)
                     result_text = format_reward_claim_results(results)
                     refresh_after = True
+                    return
+                permit = self._request_coordinator.try_begin(
+                    "reward-claim",
+                    group=TASK_API_GROUP,
+                )
+                if permit is None:
+                    result_text = "账号任务请求正在执行或冷却中，请稍后重试"
                     return
 
                 async def _claim():
@@ -272,6 +302,11 @@ class TaskController:
                 logging.getLogger(__name__).warning("领取奖励失败: %s", exc)
                 result_text = f"领取奖励失败: {exc}"
             finally:
+                if permit is not None:
+                    self._request_coordinator.finish(
+                        permit,
+                        cooldown_seconds=(30.0 if looks_rate_limited(result_text) else 0.0),
+                    )
                 with self._reward_claim_lock:
                     self._reward_claim_inflight = False
                 if result_text:

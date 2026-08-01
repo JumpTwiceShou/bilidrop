@@ -47,6 +47,8 @@ def test_new_settings_payload_excludes_secrets() -> None:
     assert payload["automatic_mining_enabled"] is True
     assert payload["apply_to_all_accounts"] is True
     assert payload["concurrency_policy_version"] == 2
+    assert payload["settings_schema_version"] == 5
+    assert "task_ids" not in payload
 
 
 def test_legacy_config_is_still_readable() -> None:

@@ -8,13 +8,21 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from bilibili_drops_miner.client import BilibiliClient, TaskProgress
+from bilibili_drops_miner.automatic_mining import all_task_rewards_claimed
 from bilibili_drops_miner.config import MinerConfig
 from bilibili_drops_miner.domain import TaskSnapshot
 from bilibili_drops_miner.notifier import MultiPlatformNotifier
+from bilibili_drops_miner.request_coordinator import (
+    TASK_API_GROUP,
+    AccountRequestCoordinator,
+    RequestPermit,
+    looks_rate_limited,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 TaskSnapshotCallback = Callable[[TaskSnapshot], None]
+RewardsSettledCallback = Callable[[tuple[str, ...]], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,12 +82,18 @@ class AccountTaskMonitor:
         config: MinerConfig,
         account_label: str = "",
         on_snapshot: TaskSnapshotCallback | None = None,
+        on_rewards_settled: RewardsSettledCallback | None = None,
+        request_coordinator: AccountRequestCoordinator | None = None,
     ) -> None:
         self.client = client
         self.notifier = notifier
         self.config = config
         self.account_label = account_label.strip() or "未识别账号"
         self.on_snapshot = on_snapshot
+        self.on_rewards_settled = on_rewards_settled
+        self._request_coordinator = (
+            request_coordinator or AccountRequestCoordinator()
+        )
         self._stop_event = asyncio.Event()
         self._refresh_event = asyncio.Event()
         self._claim_lock = asyncio.Lock()
@@ -89,6 +103,7 @@ class AccountTaskMonitor:
         self._claim_failure_counts: dict[str, int] = {}
         self._claim_retry_after: dict[str, float] = {}
         self._latest_progresses: list[TaskProgress] = []
+        self._rewards_settled_notified = False
 
     def request_refresh(self) -> None:
         self._refresh_event.set()
@@ -106,7 +121,20 @@ class AccountTaskMonitor:
                 continue
 
             try:
-                progresses = await self.client.get_task_progress(list(task_ids))
+                permit = await self._acquire_task_api("task-monitor-refresh")
+                if permit is None:
+                    await self._wait_for_next(2)
+                    continue
+                query_error: BaseException | None = None
+                try:
+                    progresses = await self.client.get_task_progress(
+                        list(task_ids)
+                    )
+                except BaseException as exc:
+                    query_error = exc
+                    raise
+                finally:
+                    self._finish_task_api(permit, query_error)
                 self._latest_progresses = list(progresses)
                 self._apply_known_claimed_statuses(progresses)
                 snapshot = TaskSnapshot(progresses=tuple(progresses))
@@ -117,7 +145,13 @@ class AccountTaskMonitor:
                     for attempt in claim_results
                 ):
                     self._emit(TaskSnapshot(progresses=tuple(progresses)))
-                await self._notify_new_completions(progresses, claim_results)
+                try:
+                    await self._notify_new_completions(
+                        progresses,
+                        claim_results,
+                    )
+                finally:
+                    self._notify_rewards_settled(progresses)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -130,40 +164,67 @@ class AccountTaskMonitor:
 
     async def claim_rewards(self):
         async with self._claim_lock:
+            permit = await self._acquire_task_api("reward-claim")
+            if permit is None:
+                return []
+            claim_error: BaseException | None = None
             task_ids = tuple(self.config.task_ids)
-            if not task_ids:
-                return []
-            if not self._latest_progresses:
-                self._latest_progresses = list(
-                    await self.client.get_task_progress(list(task_ids))
+            try:
+                if not task_ids:
+                    return []
+                if not self._latest_progresses:
+                    self._latest_progresses = list(
+                        await self.client.get_task_progress(list(task_ids))
+                    )
+                    self._apply_known_claimed_statuses(
+                        self._latest_progresses
+                    )
+                units = [
+                    unit
+                    for unit in _completed_units(self._latest_progresses)
+                    if self._is_claimable(unit.progress)
+                ]
+                claim_ids = [unit.claim_task_id for unit in units]
+                if not claim_ids:
+                    return []
+                results = await self.client.receive_all_mission_rewards(
+                    claim_ids
                 )
-                self._apply_known_claimed_statuses(self._latest_progresses)
-            units = [
-                unit
-                for unit in _completed_units(self._latest_progresses)
-                if self._is_claimable(unit.progress)
-            ]
-            claim_ids = [unit.claim_task_id for unit in units]
-            if not claim_ids:
-                return []
-            results = await self.client.receive_all_mission_rewards(claim_ids)
-            for unit, result in zip(units, results):
-                if self._claim_succeeded(result):
-                    self._auto_claimed_completion_ids.add(unit.marker_id)
-                    self._clear_claim_failure(unit.marker_id)
-                    unit.progress.status = 3
-                else:
-                    self._record_claim_failure(unit.marker_id)
-            if units:
-                self._emit(TaskSnapshot(progresses=tuple(self._latest_progresses)))
-            return results
+                for unit, result in zip(units, results):
+                    if self._claim_succeeded(result):
+                        self._auto_claimed_completion_ids.add(unit.marker_id)
+                        self._clear_claim_failure(unit.marker_id)
+                        unit.progress.status = 3
+                    else:
+                        self._record_claim_failure(unit.marker_id)
+                if units:
+                    self._emit(
+                        TaskSnapshot(progresses=tuple(self._latest_progresses))
+                    )
+                    self._notify_rewards_settled(self._latest_progresses)
+                return results
+            except BaseException as exc:
+                claim_error = exc
+                raise
+            finally:
+                self._finish_task_api(permit, claim_error)
 
     async def claim_reward_task_ids(self, task_ids: list[str]):
         normalized = list(dict.fromkeys(task_id for task_id in task_ids if task_id))
         if not normalized:
             return []
         async with self._claim_lock:
-            return await self.client.receive_all_mission_rewards(normalized)
+            permit = await self._acquire_task_api("reward-claim-task-ids")
+            if permit is None:
+                return []
+            claim_error: BaseException | None = None
+            try:
+                return await self.client.receive_all_mission_rewards(normalized)
+            except BaseException as exc:
+                claim_error = exc
+                raise
+            finally:
+                self._finish_task_api(permit, claim_error)
 
     async def _auto_claim_new_completions(
         self, progresses: list[TaskProgress]
@@ -187,7 +248,19 @@ class AccountTaskMonitor:
         task_ids = [unit.claim_task_id for unit in pending_units]
         try:
             async with self._claim_lock:
-                results = await self.client.receive_all_mission_rewards(task_ids)
+                permit = await self._acquire_task_api("auto-reward-claim")
+                if permit is None:
+                    return []
+                claim_error: BaseException | None = None
+                try:
+                    results = await self.client.receive_all_mission_rewards(
+                        task_ids
+                    )
+                except BaseException as exc:
+                    claim_error = exc
+                    raise
+                finally:
+                    self._finish_task_api(permit, claim_error)
             attempts = [
                 _ClaimAttempt(
                     unit=unit,
@@ -373,6 +446,40 @@ class AccountTaskMonitor:
         self._claim_failure_counts.pop(marker_id, None)
         self._claim_retry_after.pop(marker_id, None)
 
+    async def _acquire_task_api(
+        self,
+        operation: str,
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> RequestPermit | None:
+        deadline = time.monotonic() + timeout_seconds
+        while not self._stop_event.is_set():
+            permit = self._request_coordinator.try_begin(
+                operation,
+                group=TASK_API_GROUP,
+            )
+            if permit is not None:
+                return permit
+            if time.monotonic() >= deadline:
+                return None
+            cooldown = self._request_coordinator.cooldown_remaining(
+                TASK_API_GROUP
+            )
+            await asyncio.sleep(min(1.0, max(0.1, cooldown)))
+        return None
+
+    def _finish_task_api(
+        self,
+        permit: RequestPermit,
+        error: BaseException | None,
+    ) -> None:
+        self._request_coordinator.finish(
+            permit,
+            cooldown_seconds=(
+                30.0 if error is not None and looks_rate_limited(error) else 0.0
+            ),
+        )
+
     def _emit(self, snapshot: TaskSnapshot) -> None:
         if self.on_snapshot is None:
             return
@@ -380,3 +487,23 @@ class AccountTaskMonitor:
             self.on_snapshot(snapshot)
         except Exception:
             LOGGER.exception("任务快照回调失败")
+
+    def _notify_rewards_settled(
+        self,
+        progresses: list[TaskProgress],
+    ) -> None:
+        if self._rewards_settled_notified:
+            return
+        if not all_task_rewards_claimed(
+            TaskSnapshot(progresses=tuple(progresses))
+        ):
+            return
+        self._rewards_settled_notified = True
+        if self.on_rewards_settled is None:
+            return
+        try:
+            self.on_rewards_settled(
+                tuple(task.task_id for task in progresses if task.task_id)
+            )
+        except Exception:
+            LOGGER.exception("任务奖励全部完成回调失败")

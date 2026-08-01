@@ -18,13 +18,19 @@ from bilibili_drops_miner.automatic_mining import (
     ScheduledTaskSelection,
 )
 from bilibili_drops_miner.credential_store import MemoryCredentialStore
-from bilibili_drops_miner.domain import ApplicationState, RuntimeHealth, TaskSnapshot
+from bilibili_drops_miner.domain import (
+    ApplicationState,
+    DiscoveredTaskGroup,
+    RuntimeHealth,
+    TaskSnapshot,
+)
 from bilibili_drops_miner.gui_parts import main_window as main_window_module
 from bilibili_drops_miner.gui_parts.account_sessions import LoginState
 from bilibili_drops_miner.gui_parts.cookie_profiles import (
     CookieProfile,
     CookieProfileState,
 )
+from bilibili_drops_miner.runtime_state import AutomationState, RunOwner
 
 
 @pytest.fixture(scope="module")
@@ -84,6 +90,7 @@ def _dispose_window(item, app) -> None:
 
 
 def test_initial_gui_is_guided_and_secrets_are_masked(window, app) -> None:
+    assert window.windowTitle().endswith("v2.1.0")
     assert window.runtime_state_label.text() == "未运行"
     assert window.cookie_edit.echoMode() == QLineEdit.Password
     assert window.notify_urls_edit.echoMode() == QLineEdit.Password
@@ -97,10 +104,14 @@ def test_initial_gui_is_guided_and_secrets_are_masked(window, app) -> None:
     assert "tgram://BotToken/ChatID" in window.notify_urls_edit.placeholderText()
     assert window.claim_rewards_btn.text() == "手动领取"
     assert window.start_btn.text() == "开始"
-    assert window.enable_auto_btn.text() == "后台自动挂机"
+    assert window.boost_concurrency_btn.text() == "加速执行（本次 100 线程）"
     assert not window.apply_all_switch.isChecked()
     assert window.apply_all_switch.accessibleName() == "应用到所有账号"
-    assert "每次打开程序后需要手动开启" in window.auto_mining_description.text()
+    assert "后台任务检测" in window.auto_mining_description.text()
+    assert not any(
+        "后台自动" in button.text()
+        for button in window.findChildren(QPushButton)
+    )
     assert not window.watch_time_label.isVisible()
     assert not window._live_watch_time_timer.isActive()
     assert not any(
@@ -118,6 +129,10 @@ def test_initial_gui_is_guided_and_secrets_are_masked(window, app) -> None:
 
     window.show()
     app.processEvents()
+    assert (
+        window.boost_concurrency_btn.width()
+        >= window.boost_concurrency_btn.sizeHint().width()
+    )
     row_y = {
         widget.mapTo(window, QPoint(0, widget.height() // 2)).y()
         for widget in (
@@ -220,7 +235,68 @@ def test_startup_settings_do_not_erase_saved_account_identity(
         assert "UID 10002" in item.cookie_profile_combo.currentText()
         assert item.rooms_edit.text() == "23612045"
         assert item._automatic_mining_session_ids == set()
-        assert item.enable_auto_btn.text() == "后台自动挂机"
+        assert not hasattr(item, "enable_auto_btn")
+    finally:
+        _dispose_window(item, app)
+
+
+def test_saved_account_settings_override_global_defaults_while_legacy_inherits(
+    monkeypatch,
+    app,
+) -> None:
+    store = MemoryCredentialStore()
+    profiles = [
+        CookieProfile(
+            "固定账号",
+            "DedeUserID=10001; SESSDATA=one",
+            credential_id="account-one",
+            settings={
+                "rooms_text": "111",
+                "thread_count": 32,
+                "concurrency_mode": "fixed",
+            },
+        ),
+        CookieProfile(
+            "旧版账号",
+            "DedeUserID=10002; SESSDATA=two",
+            credential_id="account-two",
+        ),
+    ]
+    monkeypatch.setattr(main_window_module, "JsonCredentialStore", lambda: store)
+    monkeypatch.setattr(
+        main_window_module,
+        "load_cookie_profile_state",
+        lambda **kwargs: CookieProfileState(profiles, "account-two"),
+    )
+    monkeypatch.setattr(
+        main_window_module,
+        "load_stored_config_data",
+        lambda *_args, **_kwargs: {
+            "room_ids": [23612045],
+            "thread_count": 16,
+            "concurrency_mode": "automatic",
+            "concurrency_policy_version": 2,
+        },
+    )
+    monkeypatch.setattr(
+        main_window_module,
+        "save_cookie_profiles",
+        lambda *args, **kwargs: None,
+    )
+
+    item = main_window_module.MinerGUI()
+    try:
+        fixed, legacy = tuple(item._account_sessions.values())
+        assert (fixed.rooms_text, fixed.thread_count, fixed.concurrency_mode) == (
+            "111",
+            32,
+            "fixed",
+        )
+        assert (
+            legacy.rooms_text,
+            legacy.thread_count,
+            legacy.concurrency_mode,
+        ) == ("23612045", 16, "automatic")
     finally:
         _dispose_window(item, app)
 
@@ -256,38 +332,19 @@ def test_disabled_update_check_does_not_contact_release_api(
     window._check_update_silent()
 
 
-def test_background_automatic_mining_controls_are_mutually_exclusive(
-    window,
-) -> None:
-    window.enable_background_auto()
-    assert window.enable_auto_btn.text() == "停止后台自动"
-    assert "已开启" in window.auto_mining_description.text()
+def test_stopping_watch_sessions_preserves_background_task_monitor(window) -> None:
+    session = window._active_session
+    session.controller = _FakeWorkerController()
+    session.controller.is_running = True
+    session.run_owner = RunOwner.MANUAL
+    window._automatic_mining_session_ids.add(session.session_id)
 
-    window.disable_background_auto()
-    assert window.enable_auto_btn.text() == "后台自动挂机"
+    window._stop_continuous_scope((session,))
 
-
-def test_stopping_background_auto_stops_only_auto_started_runtime(window) -> None:
-    auto_session = window._active_session
-    auto_session.controller = _FakeWorkerController()
-    auto_session.controller.is_running = True
-    auto_session.auto_started_runtime = True
-    window._automatic_mining_session_ids.add(auto_session.session_id)
-
-    window.disable_background_auto()
-
-    assert auto_session.controller.stop_requests == 1
-    assert not auto_session.controller.is_running
-
-    auto_session.controller = _FakeWorkerController()
-    auto_session.controller.is_running = True
-    auto_session.auto_started_runtime = False
-    window._automatic_mining_session_ids.add(auto_session.session_id)
-
-    window.disable_background_auto()
-
-    assert auto_session.controller.stop_requests == 0
-    assert auto_session.controller.is_running
+    assert session.controller.stop_requests == 1
+    assert not session.controller.is_running
+    assert session.session_id in window._automatic_mining_session_ids
+    assert session.automation_state == AutomationState.ARMED
 
 
 def test_settings_save_and_load_use_combined_store_without_file_picker(
@@ -313,6 +370,15 @@ def test_settings_save_and_load_use_combined_store_without_file_picker(
     window.task_ids_edit.setText("daily-a,daily-b")
     window.auto_check_updates_check.setChecked(False)
     window._automatic_mining_session_ids.add(window._active_session_id)
+    account_targets: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        window,
+        "_persist_account_settings_for",
+        lambda sessions: account_targets.append(
+            tuple(session.session_id for session in sessions)
+        )
+        or True,
+    )
 
     window.save_config()
     saved = main_window_module.load_stored_config_data(
@@ -320,12 +386,17 @@ def test_settings_save_and_load_use_combined_store_without_file_picker(
     )
     assert saved["automatic_mining_enabled"] is False
     assert saved["auto_check_updates"] is False
+    assert "task_ids" not in saved
+    assert account_targets == [(window._active_session_id,)]
     window.rooms_edit.clear()
     window.task_ids_edit.clear()
     window.auto_check_updates_check.setChecked(True)
     window.load_config()
 
     assert window.rooms_edit.text() == "23612045"
+    # Loading ordinary settings must not overwrite the current in-memory task
+    # selection. Task IDs are still excluded from persisted settings, so they
+    # are not restored after a process restart.
     assert window.task_ids_edit.text() == "daily-a,daily-b"
     assert not window.auto_check_updates_check.isChecked()
 
@@ -389,6 +460,7 @@ def test_running_state_locks_account_and_room_fields(window) -> None:
 
 
 def test_runtime_health_explains_automatic_concurrency_stage(window) -> None:
+    window._active_session.run_owner = RunOwner.MANUAL
     window._render_runtime_health(
         RuntimeHealth(
             state=ApplicationState.RUNNING,
@@ -401,6 +473,7 @@ def test_runtime_health_explains_automatic_concurrency_stage(window) -> None:
     )
 
     assert "会话 当前 20 / 目标 16" in window.runtime_detail_label.text()
+    assert "手动运行" in window.runtime_detail_label.text()
     assert "自动追赶" in window.runtime_detail_label.text()
     assert "2.40 倍" in window.runtime_detail_label.text()
 
@@ -747,13 +820,26 @@ class _FakeWorkerController:
         self.configs = []
         self.stop_requests = 0
         self.on_health = None
+        self.on_rewards_settled = None
         self.task_id_updates = []
+        self.fixed_session_targets = []
 
-    def start(self, _config, *, logger, on_health, on_task_snapshot) -> bool:
+    def start(
+        self,
+        _config,
+        *,
+        logger,
+        on_health,
+        on_task_snapshot,
+        on_rewards_settled=None,
+        request_coordinator=None,
+    ) -> bool:
         self.starts += 1
         self.configs.append(_config)
         self.is_running = True
+        self.stop_signal_set = False
         self.on_health = on_health
+        self.on_rewards_settled = on_rewards_settled
         return True
 
     def request_stop(self, *, logger):
@@ -768,6 +854,154 @@ class _FakeWorkerController:
     def update_task_ids(self, _task_ids):
         self.task_id_updates.append(list(_task_ids))
         return True
+
+    def force_fixed_sessions_per_room(self, target):
+        self.fixed_session_targets.append(target)
+        return self.is_running
+
+    def claim_reward_task_ids(self, _task_ids):
+        return None
+
+
+def test_claimed_rewards_stop_watch_threads_but_keep_monitoring(window) -> None:
+    session = window._active_session
+    session.controller = _FakeWorkerController()
+    session.controller.is_running = True
+    session.run_owner = RunOwner.MANUAL
+    session.cookie = "DedeUserID=10001; SESSDATA=one"
+    session.task_ids_text = "daily"
+    window._automatic_mining_session_ids.add(session.session_id)
+
+    window._stop_runtime_after_rewards_claimed(
+        session.session_id,
+        ("daily",),
+    )
+
+    assert not session.controller.is_running
+    assert session.session_id in window._automatic_mining_session_ids
+    assert session.completion_auto_stop_key == window._completion_run_key(
+        ["daily"]
+    )
+    assert "观看线程已自动关闭" in session.discovery_status_text
+
+
+def test_restart_after_claimed_guard_disables_auto_pause_for_this_run(
+    window,
+    monkeypatch,
+) -> None:
+    session = window._active_session
+    session.controller = _FakeWorkerController()
+    session.cookie = "DedeUserID=10001; SESSDATA=one"
+    session.login_state = LoginState.VALID
+    session.rooms_text = "23612045"
+    session.task_ids_text = "daily"
+    session.completion_auto_stop_key = window._completion_run_key(["daily"])
+    messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_show_info",
+        lambda title, message: messages.append((title, message)),
+    )
+
+    assert window._start_account_session(session, interactive=True)
+    assert session.completion_auto_stop_bypass
+    assert messages and messages[0][0] == "继续挂机"
+    assert "本次不会自动暂停" in messages[0][1]
+
+    window._stop_runtime_after_rewards_claimed(
+        session.session_id,
+        ("daily",),
+    )
+
+    assert session.controller.is_running
+    assert session.controller.stop_requests == 0
+    assert "请手动停止" in session.discovery_status_text
+
+
+def test_new_task_group_restores_completion_auto_pause(window) -> None:
+    session = window._active_session
+    session.controller = _FakeWorkerController()
+    session.cookie = "DedeUserID=10001; SESSDATA=one"
+    session.login_state = LoginState.VALID
+    session.rooms_text = "23612045"
+    session.task_ids_text = "new-daily"
+    session.completion_auto_stop_key = window._completion_run_key(["old-daily"])
+
+    assert window._start_account_session(session, interactive=False)
+    assert not session.completion_auto_stop_bypass
+
+    window._stop_runtime_after_rewards_claimed(
+        session.session_id,
+        ("new-daily",),
+    )
+
+    assert not session.controller.is_running
+    assert session.completion_auto_stop_key == window._completion_run_key(
+        ["new-daily"]
+    )
+
+
+def test_stale_claimed_signal_does_not_stop_new_task_group(window) -> None:
+    session = window._active_session
+    session.controller = _FakeWorkerController()
+    session.controller.is_running = True
+    session.cookie = "DedeUserID=10001; SESSDATA=one"
+    session.task_ids_text = "new-daily"
+
+    window._stop_runtime_after_rewards_claimed(
+        session.session_id,
+        ("old-daily",),
+    )
+
+    assert session.controller.is_running
+    assert session.controller.stop_requests == 0
+    assert session.completion_auto_stop_key is None
+
+
+def test_run_owner_is_assigned_before_worker_start(window, monkeypatch) -> None:
+    session = window._active_session
+    observed: list[RunOwner] = []
+
+    class InspectingController(_FakeWorkerController):
+        def start(self, *args, **kwargs) -> bool:
+            observed.append(session.run_owner)
+            return super().start(*args, **kwargs)
+
+    session.controller = InspectingController()
+    session.cookie = "DedeUserID=10001; SESSDATA=one"
+    session.login_state = LoginState.VALID
+    window.cookie_edit.setText(session.cookie)
+    window.rooms_edit.setText("23612045")
+    monkeypatch.setattr(window, "_schedule_task_refresh", lambda: None)
+
+    window.start()
+
+    assert observed == [RunOwner.MANUAL]
+
+
+def test_worker_start_exception_restores_run_owner(window, monkeypatch) -> None:
+    session = window._active_session
+
+    class FailingController(_FakeWorkerController):
+        def start(self, *args, **kwargs) -> bool:
+            raise RuntimeError("synthetic start failure")
+
+    session.controller = FailingController()
+    session.cookie = "DedeUserID=10001; SESSDATA=one"
+    session.login_state = LoginState.VALID
+    window.cookie_edit.setText(session.cookie)
+    window.rooms_edit.setText("23612045")
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_show_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    window.start()
+
+    assert session.run_owner == RunOwner.NONE
+    assert errors == [("启动失败", "synthetic start failure")]
 
 
 def test_profile_selector_displays_invalid_login_state(window) -> None:
@@ -829,6 +1063,36 @@ def test_invalid_saved_profile_cannot_start(window, monkeypatch) -> None:
     assert session.controller.starts == 0
     assert warnings[0][0] == "登录已失效"
     assert "扫码登录" in warnings[0][1]
+
+
+def test_temporary_cookie_requires_same_login_validation_before_start(
+    window,
+    monkeypatch,
+) -> None:
+    warnings: list[tuple[str, str]] = []
+    validations: list[str] = []
+    session = window._active_session
+    session.controller = _FakeWorkerController()
+    session.cookie = "DedeUserID=10001; SESSDATA=temporary"
+    session.login_state = LoginState.UNKNOWN
+    window.cookie_edit.setText(session.cookie)
+    window.rooms_edit.setText("23612045")
+    monkeypatch.setattr(
+        window,
+        "_begin_account_login_validation",
+        lambda target: validations.append(target.session_id),
+    )
+    monkeypatch.setattr(
+        window,
+        "_show_warning",
+        lambda title, message: warnings.append((title, message)),
+    )
+
+    window.start()
+
+    assert session.controller.starts == 0
+    assert validations == [session.session_id]
+    assert warnings[0][0] == "正在检测登录状态"
 
 
 def test_qr_same_uid_refreshes_profile_without_overwriting_remark(
@@ -912,7 +1176,9 @@ def test_two_accounts_can_start_and_show_running_state(window, monkeypatch) -> N
 
     first = window._active_session
     first.controller = _FakeWorkerController()
-    window.cookie_edit.setText("DedeUserID=10001; SESSDATA=one")
+    first.cookie = "DedeUserID=10001; SESSDATA=one"
+    first.login_state = LoginState.VALID
+    window.cookie_edit.setText(first.cookie)
     window.rooms_edit.setText("111")
     window.task_ids_edit.setText("task-one")
     window.start()
@@ -924,7 +1190,9 @@ def test_two_accounts_can_start_and_show_running_state(window, monkeypatch) -> N
     window.new_temporary_account()
     second = window._active_session
     second.controller = _FakeWorkerController()
-    window.cookie_edit.setText("DedeUserID=10002; SESSDATA=two")
+    second.cookie = "DedeUserID=10002; SESSDATA=two"
+    second.login_state = LoginState.VALID
+    window.cookie_edit.setText(second.cookie)
     window.rooms_edit.setText("222")
     window.task_ids_edit.setText("task-two")
     window.start()
@@ -935,6 +1203,8 @@ def test_two_accounts_can_start_and_show_running_state(window, monkeypatch) -> N
 
     assert first.controller.starts == 1
     assert second.controller.starts == 1
+    assert first.controller.configs[0].thread_count == 32
+    assert second.controller.configs[0].thread_count == 16
     assert first.controller.is_running
     assert second.controller.is_running
     labels = [
@@ -957,7 +1227,9 @@ def test_room_and_cookie_can_start_without_task_ids(window, monkeypatch) -> None
 
     controller = _FakeWorkerController()
     window._active_session.controller = controller
-    window.cookie_edit.setText("DedeUserID=10001; SESSDATA=fixture")
+    window._active_session.cookie = "DedeUserID=10001; SESSDATA=fixture"
+    window._active_session.login_state = LoginState.VALID
+    window.cookie_edit.setText(window._active_session.cookie)
     window.rooms_edit.setText("23612045")
     window.task_ids_edit.clear()
 
@@ -966,6 +1238,8 @@ def test_room_and_cookie_can_start_without_task_ids(window, monkeypatch) -> None
     assert controller.starts == 1
     assert controller.configs[0].room_ids == [23612045]
     assert controller.configs[0].task_ids == []
+    assert controller.configs[0].thread_count == 32
+    assert not controller.configs[0].automatic_start_in_steady_mode
     assert discovery_calls == []
     assert "已直接开始挂机" in window.discovery_status_label.text()
     assert "任务进度和自动领奖暂不可用" in window.task_table.item(0, 0).text()
@@ -993,6 +1267,7 @@ def test_scope_switch_applies_run_toggle_to_current_or_all_accounts(
     first = window._active_session
     first.controller = _FakeWorkerController()
     first.cookie = "DedeUserID=10001; SESSDATA=one"
+    first.login_state = LoginState.VALID
     first.rooms_text = "111"
     window.cookie_edit.setText(first.cookie)
     window.rooms_edit.setText(first.rooms_text)
@@ -1000,7 +1275,10 @@ def test_scope_switch_applies_run_toggle_to_current_or_all_accounts(
     second = window._active_session
     second.controller = _FakeWorkerController()
     second.cookie = "DedeUserID=10002; SESSDATA=two"
+    second.login_state = LoginState.VALID
     second.rooms_text = "222"
+    window.cookie_edit.setText(second.cookie)
+    window.rooms_edit.setText(second.rooms_text)
     window._restore_active_session()
     monkeypatch.setattr(window, "_schedule_task_refresh", lambda: None)
 
@@ -1008,15 +1286,23 @@ def test_scope_switch_applies_run_toggle_to_current_or_all_accounts(
     window.toggle_run_scope()
     assert not first.controller.is_running
     assert second.controller.is_running
+    assert window._automatic_mining_session_ids == {second.session_id}
     assert window.start_btn.text() == "停止"
 
     window.toggle_run_scope()
     assert not second.controller.is_running
+    assert window._automatic_mining_session_ids == {second.session_id}
 
     window.apply_all_switch.setChecked(True)
     window.toggle_run_scope()
     assert first.controller.is_running
     assert second.controller.is_running
+    assert first.controller.configs[-1].thread_count == 16
+    assert second.controller.configs[-1].thread_count == 16
+    assert window._automatic_mining_session_ids == {
+        first.session_id,
+        second.session_id,
+    }
     assert window.start_btn.text() == "停止"
 
     window.toggle_run_scope()
@@ -1024,15 +1310,25 @@ def test_scope_switch_applies_run_toggle_to_current_or_all_accounts(
     assert not second.controller.is_running
 
 
-def test_scope_switch_applies_background_auto_to_current_or_all_accounts(
+def test_legacy_background_toggle_uses_unified_run_control(
     window,
     monkeypatch,
 ) -> None:
     first = window._active_session
+    first.controller = _FakeWorkerController()
     first.cookie = "DedeUserID=10001; SESSDATA=one"
+    first.login_state = LoginState.VALID
+    first.rooms_text = "111"
     window.cookie_edit.setText(first.cookie)
+    window.rooms_edit.setText(first.rooms_text)
     window.new_temporary_account()
     second = window._active_session
+    second.controller = _FakeWorkerController()
+    second.cookie = "DedeUserID=10002; SESSDATA=two"
+    second.login_state = LoginState.VALID
+    second.rooms_text = "222"
+    window.cookie_edit.setText(second.cookie)
+    window.rooms_edit.setText(second.rooms_text)
     ticks: list[bool] = []
     monkeypatch.setattr(
         window,
@@ -1043,10 +1339,13 @@ def test_scope_switch_applies_background_auto_to_current_or_all_accounts(
     window.apply_all_switch.setChecked(False)
     window.toggle_background_auto_scope()
     assert window._automatic_mining_session_ids == {second.session_id}
-    assert window.enable_auto_btn.text() == "停止后台自动"
+    assert second.controller.is_running
+    assert second.automatic_guard_started_at is not None
+    assert not window._automatic_start_uses_steady_sessions(second)
 
     window.toggle_background_auto_scope()
-    assert not window._automatic_mining_session_ids
+    assert not second.controller.is_running
+    assert window._automatic_mining_session_ids == {second.session_id}
 
     window.apply_all_switch.setChecked(True)
     window.toggle_background_auto_scope()
@@ -1054,7 +1353,190 @@ def test_scope_switch_applies_background_auto_to_current_or_all_accounts(
         first.session_id,
         second.session_id,
     }
-    assert window.enable_auto_btn.text() == "停止后台自动"
+    assert first.controller.is_running
+    assert second.controller.is_running
+
+
+def test_automatic_initial_sessions_depend_on_guard_time_not_task_start(
+    window,
+) -> None:
+    session = window._active_session
+    session.cookie = "DedeUserID=10001; SESSDATA=fixture"
+    session.rooms_text = "23612045"
+    session.task_started_at = datetime(
+        2026, 8, 1, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+    )
+
+    manual_config = window._build_session_config(session)
+    guarded_config = window._build_session_config(
+        session,
+        automatic_start_in_steady_mode=True,
+    )
+
+    assert not manual_config.automatic_start_in_steady_mode
+    assert guarded_config.automatic_start_in_steady_mode
+    session.automatic_guard_started_at = 100.0
+    assert not window._automatic_start_uses_steady_sessions(
+        session,
+        now=999.0,
+    )
+    assert window._automatic_start_uses_steady_sessions(
+        session,
+        now=1000.0,
+    )
+
+
+def test_background_scope_counts_armed_accounts_before_they_all_validate(
+    window,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(window, "_schedule_task_refresh", lambda: None)
+    first = window._active_session
+    first.controller = _FakeWorkerController()
+    first.cookie = "DedeUserID=10001; SESSDATA=one"
+    first.login_state = LoginState.VALID
+    first.rooms_text = "111"
+    window.cookie_edit.setText(first.cookie)
+    window.rooms_edit.setText(first.rooms_text)
+    window.new_temporary_account()
+    second = window._active_session
+    second.cookie = "DedeUserID=10002; SESSDATA=two"
+    second.login_state = LoginState.CHECKING
+    second.rooms_text = "222"
+    window._automatic_mining_session_ids.update(
+        {first.session_id, second.session_id}
+    )
+
+    assert window._start_account_session(first, interactive=False)
+
+    assert first.controller.configs[0].thread_count == 16
+
+
+def test_boost_ignores_empty_workspace_when_apply_all_is_enabled(
+    window,
+    monkeypatch,
+) -> None:
+    first = window._active_session
+    first.controller = _FakeWorkerController()
+    first.cookie = "DedeUserID=10001; SESSDATA=one"
+    window.cookie_edit.setText(first.cookie)
+    window.new_temporary_account()
+    empty = window._active_session
+    choices: list[int] = []
+    messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_choose_concurrency_boost_mode",
+        lambda count, **_kwargs: choices.append(count) or "once",
+    )
+    monkeypatch.setattr(
+        window,
+        "_show_info",
+        lambda title, message: messages.append((title, message)),
+    )
+
+    window.apply_all_switch.setChecked(True)
+    window.boost_concurrency_scope()
+
+    assert choices == [1]
+    assert first.runtime_concurrency_override == 100
+    assert window._build_session_config(first).thread_count == 100
+    assert empty.runtime_concurrency_override is None
+    assert "1 个账号" in messages[0][1]
+    assert "不计时" in messages[0][1]
+
+    window._stop_account_session(first)
+    assert first.runtime_concurrency_override is None
+
+
+def test_persistent_boost_switches_running_accounts_to_fixed_32(
+    window,
+    monkeypatch,
+) -> None:
+    session = window._active_session
+    session.controller = _FakeWorkerController()
+    session.controller.is_running = True
+    session.cookie = "DedeUserID=10001; SESSDATA=one"
+    window.cookie_edit.setText(session.cookie)
+    persisted: list[bool] = []
+    monkeypatch.setattr(
+        window,
+        "_choose_concurrency_boost_mode",
+        lambda _count, **_kwargs: "persistent",
+    )
+    monkeypatch.setattr(
+        window,
+        "_persist_fixed_concurrency_setting",
+        lambda: persisted.append(True),
+    )
+    monkeypatch.setattr(window, "_show_info", lambda *_args: None)
+
+    window.boost_concurrency_scope()
+
+    assert session.concurrency_mode == "fixed"
+    assert session.thread_count == 32
+    assert session.controller.fixed_session_targets == [32]
+    assert persisted == [True]
+
+
+def test_fixed_32_or_higher_keeps_once_boost_but_hides_persistent_choice(
+    window,
+    monkeypatch,
+) -> None:
+    session = window._active_session
+    session.controller = _FakeWorkerController()
+    session.cookie = "DedeUserID=10001; SESSDATA=one"
+    session.concurrency_mode = "fixed"
+    session.thread_count = 48
+    session.runtime_concurrency_override = 100
+    window.cookie_edit.setText(session.cookie)
+    window.threads_spin.setValue(48)
+    fixed_index = window.concurrency_mode_combo.findData("fixed")
+    window.concurrency_mode_combo.setCurrentIndex(fixed_index)
+    captured: list[tuple[int, bool]] = []
+    monkeypatch.setattr(
+        window,
+        "_choose_concurrency_boost_mode",
+        lambda count, **kwargs: captured.append(
+            (count, kwargs["existing_fixed_high"])
+        )
+        or "once",
+    )
+    monkeypatch.setattr(window, "_show_info", lambda *_args: None)
+
+    window.boost_concurrency_scope()
+
+    assert captured == [(1, True)]
+    assert session.thread_count == 48
+    assert session.runtime_concurrency_override == 100
+
+
+def test_failed_account_settings_write_restores_in_memory_override_state(
+    window,
+    monkeypatch,
+) -> None:
+    session = window._active_session
+    session.cookie = "DedeUserID=10001; SESSDATA=one"
+    session.temporary = False
+    session.credential_id = "account-one"
+    session.account_settings_saved = False
+    profile = CookieProfile(
+        "旧版账号",
+        session.cookie,
+        credential_id=session.credential_id,
+    )
+    window._cookie_profiles = [profile]
+    monkeypatch.setattr(window, "_backup_cookie_profiles", lambda _reason: True)
+
+    def fail_write() -> None:
+        profile.settings = {"thread_count": 32}
+        raise OSError("synthetic write failure")
+
+    monkeypatch.setattr(window, "_write_cookie_profiles", fail_write)
+
+    assert not window._persist_account_settings_for((session,))
+    assert not session.account_settings_saved
+    assert profile.settings == {}
 
 
 def test_runtime_input_change_immediately_wakes_enabled_background_auto(
@@ -1063,6 +1545,7 @@ def test_runtime_input_change_immediately_wakes_enabled_background_auto(
 ) -> None:
     session = window._active_session
     session.next_automatic_check_at = 99_999_999_999.0
+    session.automatic_guard_started_at = 1.0
     window._automatic_mining_session_ids.add(session.session_id)
     ticks: list[bool] = []
     monkeypatch.setattr(
@@ -1078,6 +1561,7 @@ def test_runtime_input_change_immediately_wakes_enabled_background_auto(
     assert session.rooms_text == "23612045"
     assert session.task_ids_text == "task-a"
     assert session.next_automatic_check_at == 0.0
+    assert session.automatic_guard_started_at > 1.0
 
 
 def test_expired_automatic_task_clears_stale_progress_and_stops_auto_runtime(
@@ -1125,3 +1609,125 @@ def test_expired_automatic_task_clears_stale_progress_and_stops_auto_runtime(
     assert session.task_ends_at is None
     assert not session.latest_task_snapshot.progresses
     assert "旧任务已结束" in session.discovery_status_text
+
+
+def test_stale_automatic_result_cannot_overwrite_new_configuration(
+    window,
+    monkeypatch,
+) -> None:
+    session = window._active_session
+    session.configuration_generation = 2
+    session.task_ids_text = "new-task"
+    session.automatic_check_inflight = True
+    window._automatic_mining_session_ids.add(session.session_id)
+    ticks: list[bool] = []
+    monkeypatch.setattr(
+        window,
+        "_automatic_mining_tick",
+        lambda: ticks.append(True),
+    )
+    group = DiscoveredTaskGroup("旧任务", ("old-task",), active=True)
+
+    window._apply_automatic_account_check(
+        AutomaticAccountCheckResult(
+            session_id=session.session_id,
+            selection=ScheduledTaskSelection(group, "current", 15 * 60),
+            generation=1,
+            snapshot=TaskSnapshot(
+                progresses=(TaskProgress("old-task", "旧任务", 1, 0, 60),)
+            ),
+            live_status=1,
+        )
+    )
+
+    assert session.task_ids_text == "new-task"
+    assert not session.latest_task_snapshot.progresses
+    assert session.next_automatic_check_at == 0.0
+    assert session.automation_state == AutomationState.ARMED
+
+
+@pytest.mark.parametrize("phase", ["future", "current"])
+def test_background_check_waits_for_runtime_reward_callback_before_stop(
+    window,
+    monkeypatch,
+    phase,
+) -> None:
+    session = window._active_session
+    session.controller = _FakeWorkerController()
+    session.controller.is_running = True
+    session.run_owner = RunOwner.MANUAL
+    session.configuration_generation = 0
+    window._automatic_mining_session_ids.add(session.session_id)
+    stopped: list[str] = []
+    monkeypatch.setattr(
+        window,
+        "_stop_account_session",
+        lambda target: stopped.append(target.session_id),
+    )
+    group = DiscoveredTaskGroup(
+        "测试任务",
+        ("daily",),
+        active=True,
+        start_at=datetime(2026, 8, 2, 10, tzinfo=ZoneInfo("Asia/Shanghai")),
+        end_at=datetime(2026, 8, 2, 13, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    snapshot = (
+        TaskSnapshot()
+        if phase == "future"
+        else TaskSnapshot(
+            progresses=(TaskProgress("daily", "测试任务", 3, 60, 60),)
+        )
+    )
+
+    window._apply_automatic_account_check(
+        AutomaticAccountCheckResult(
+            session_id=session.session_id,
+            selection=ScheduledTaskSelection(group, phase, 15 * 60),
+            snapshot=snapshot,
+            live_status=1,
+        )
+    )
+
+    assert stopped == []
+    assert session.controller.is_running
+    assert session.run_owner == RunOwner.MANUAL
+    if phase == "current":
+        assert "正在结束观看线程" in session.discovery_status_text
+        assert session.automation_state == AutomationState.CLAIMING
+
+
+def test_loading_settings_stops_auto_runtime_but_preserves_manual_runtime(
+    window,
+) -> None:
+    manual = window._active_session
+    manual.controller = _FakeWorkerController()
+    manual.controller.is_running = True
+    manual.run_owner = RunOwner.MANUAL
+    manual.cookie = "DedeUserID=10001; SESSDATA=one"
+    window.new_temporary_account()
+    automatic = window._active_session
+    automatic.controller = _FakeWorkerController()
+    automatic.controller.is_running = True
+    automatic.run_owner = RunOwner.AUTO
+    automatic.cookie = "DedeUserID=10002; SESSDATA=two"
+    window._automatic_mining_session_ids.update(
+        {manual.session_id, automatic.session_id}
+    )
+
+    window._apply_stored_config_values(
+        main_window_module.values_from_config_data(
+            {
+                "room_ids": [23612045],
+                "thread_count": 16,
+                "concurrency_policy_version": 2,
+            }
+        )
+    )
+
+    assert manual.controller.is_running
+    assert manual.run_owner == RunOwner.MANUAL
+    assert not automatic.controller.is_running
+    assert automatic.run_owner == RunOwner.NONE
+    assert not window._automatic_mining_session_ids
+    assert manual.automation_state == AutomationState.OFF
+    assert automatic.automation_state == AutomationState.OFF

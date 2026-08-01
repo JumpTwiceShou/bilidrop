@@ -99,15 +99,88 @@ def test_runtime_can_resize_managed_sessions(monkeypatch) -> None:
         time.sleep(0.01)
     assert miner.health.target_sessions == 2
 
-    assert miner.set_target_sessions_per_room(4)
+    assert miner.force_fixed_sessions_per_room(4)
     deadline = time.monotonic() + 3
     while FakeWorker.started < 5 and time.monotonic() < deadline:
         time.sleep(0.01)
+
+    assert miner.health.concurrency_mode == "fixed"
+    assert miner.health.concurrency_phase == "fixed"
+    assert "手动加速" in miner.health.concurrency_detail
 
     miner.stop()
     thread.join(timeout=3)
     assert not thread.is_alive()
     assert FakeWorker.started == 5
+
+
+def test_automatic_runtime_uses_configured_32_session_catchup(
+    monkeypatch,
+) -> None:
+    FakeWorker.loop_ids.clear()
+    FakeWorker.started = 0
+    monkeypatch.setattr(
+        miner_module,
+        "BilibiliClient",
+        lambda _cookie: FakeClient(),
+    )
+    monkeypatch.setattr(miner_module, "AccountTaskMonitor", FakeMonitor)
+    monkeypatch.setattr(miner_module, "X25KnWorker", FakeWorker)
+    miner = miner_module.BilibiliWatchTimeMiner(
+        MinerConfig(
+            "cookie",
+            [1],
+            thread_count=32,
+            concurrency_mode="automatic",
+        )
+    )
+    thread = threading.Thread(target=miner.run)
+    thread.start()
+    deadline = time.monotonic() + 3
+    while miner.health.target_sessions != 32 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert miner.health.target_sessions == 32
+    assert "32" in miner.health.concurrency_detail
+
+    miner.stop()
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+
+
+def test_guarded_automatic_runtime_still_starts_with_two_sessions(
+    monkeypatch,
+) -> None:
+    FakeWorker.loop_ids.clear()
+    FakeWorker.started = 0
+    monkeypatch.setattr(
+        miner_module,
+        "BilibiliClient",
+        lambda _cookie: FakeClient(),
+    )
+    monkeypatch.setattr(miner_module, "AccountTaskMonitor", FakeMonitor)
+    monkeypatch.setattr(miner_module, "X25KnWorker", FakeWorker)
+    miner = miner_module.BilibiliWatchTimeMiner(
+        MinerConfig(
+            "cookie",
+            [1],
+            thread_count=32,
+            concurrency_mode="automatic",
+            automatic_start_in_steady_mode=True,
+        )
+    )
+    thread = threading.Thread(target=miner.run)
+    thread.start()
+    deadline = time.monotonic() + 3
+    while miner.health.target_sessions != 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert miner.health.target_sessions == 2
+    assert "2" in miner.health.concurrency_detail
+
+    miner.stop()
+    thread.join(timeout=3)
+    assert not thread.is_alive()
 
 
 def test_runtime_failure_is_preserved_in_health(monkeypatch) -> None:

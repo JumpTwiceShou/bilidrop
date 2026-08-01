@@ -34,10 +34,27 @@ runtime health and task snapshot. The selector changes only the workspace render
 other account runtimes continue in the background. Temporary workspaces never enter profile
 metadata, while saved metadata records only the most recently selected credential ID.
 
+Each workspace now also owns an explicit run owner, automation state, task phase,
+configuration generation and account request coordinator. Background automation may stop
+only AUTO-owned runtimes, and results created for an older Cookie/room/task generation are
+discarded. Task refresh, automated checks and reward claims for the same account share a
+serialized request group and account-level rate-limit cooldown.
+
+Protected profile metadata schema v5 can store optional account-level room and concurrency
+settings next to the account remark. Profiles created by older versions have no override and
+continue to inherit global defaults. Runtime task IDs, background-auto state and one-time
+concurrency overrides are deliberately not persisted.
+
 The account task monitor attempts reward claiming once for every newly completed task and
 retries failed claims on later polls. The GUI's manual claim action remains a recovery path.
 Advanced settings and the live log viewer are hosted in a modeless secondary window so the
 main monitoring surface stays compact while logs continue updating.
+
+Concurrency policy is presented as three distinct layers: 32-session single-account or
+16-session-per-account multi-account automatic catch-up / 2-session guarded steady start,
+a one-run 100-session override, and a persistent fixed 32-session choice. The one-run
+override is cleared when that runtime stops; the persistent choice is written to protected
+settings and can be changed later in Advanced Settings.
 
 ## Target boundaries
 

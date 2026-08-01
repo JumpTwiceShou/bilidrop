@@ -10,6 +10,12 @@ from bilibili_drops_miner.config import DEFAULT_SESSIONS_PER_ROOM
 from bilibili_drops_miner.domain import ApplicationState, RuntimeHealth, TaskSnapshot
 from bilibili_drops_miner.gui_parts.cookie_profiles import extract_cookie_uid
 from bilibili_drops_miner.gui_parts.worker_controller import WorkerController
+from bilibili_drops_miner.request_coordinator import AccountRequestCoordinator
+from bilibili_drops_miner.runtime_state import (
+    AutomationState,
+    RunOwner,
+    TaskPhase,
+)
 
 
 DEFAULT_DISCOVERY_HINT = "填写房间号后点击“识别当前任务”；无需等待直播间开播"
@@ -59,10 +65,21 @@ class AccountWorkspace:
     task_query_interval_seconds: int = 30
     notify_on_task_complete: bool = True
     concurrency_mode: str = "automatic"
-    auto_started_runtime: bool = False
+    account_settings_saved: bool = False
+    run_owner: RunOwner = RunOwner.NONE
+    automation_state: AutomationState = AutomationState.OFF
+    task_phase: TaskPhase = TaskPhase.UNKNOWN
+    configuration_generation: int = 0
+    request_coordinator: AccountRequestCoordinator = field(
+        default_factory=AccountRequestCoordinator
+    )
     next_automatic_check_at: float = 0.0
     automatic_check_inflight: bool = False
     automatic_check_pending: bool = False
+    automatic_guard_started_at: float | None = None
+    runtime_concurrency_override: int | None = None
+    completion_auto_stop_key: tuple[str, tuple[str, ...]] | None = None
+    completion_auto_stop_bypass: bool = False
     task_started_at: datetime | None = None
     task_ends_at: datetime | None = None
     application_state: ApplicationState = ApplicationState.IDLE
@@ -112,6 +129,21 @@ class AccountWorkspace:
     @property
     def state_label(self) -> str:
         return STATE_LABELS[self.application_state]
+
+    @property
+    def auto_started_runtime(self) -> bool:
+        return self.run_owner == RunOwner.AUTO
+
+    @auto_started_runtime.setter
+    def auto_started_runtime(self, value: bool) -> None:
+        if value:
+            self.run_owner = RunOwner.AUTO
+        elif self.run_owner == RunOwner.AUTO:
+            self.run_owner = RunOwner.NONE
+
+    def bump_configuration_generation(self) -> int:
+        self.configuration_generation += 1
+        return self.configuration_generation
 
     @property
     def selector_label(self) -> str:

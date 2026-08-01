@@ -59,7 +59,18 @@ def test_saved_settings_body_is_dpapi_protected_in_same_file(tmp_path) -> None:
 
 def test_cookie_profile_and_secret_share_one_store() -> None:
     store = MemoryCredentialStore()
-    profiles = [CookieProfile("主号", "fake-cookie-secret", "now")]
+    profiles = [
+        CookieProfile(
+            "主号",
+            "fake-cookie-secret",
+            "now",
+            settings={
+                "rooms_text": "23612045",
+                "thread_count": 32,
+                "concurrency_mode": "fixed",
+            },
+        )
+    ]
 
     save_cookie_profiles(profiles, credential_store=store)
     state = load_cookie_profile_state(credential_store=store)
@@ -68,6 +79,9 @@ def test_cookie_profile_and_secret_share_one_store() -> None:
     assert metadata["accounts"][0]["remark"] == "主号"
     assert "cookie" not in metadata["accounts"][0]
     assert state.profiles[0].cookie == "fake-cookie-secret"
+    assert metadata["version"] == 5
+    assert state.profiles[0].settings["thread_count"] == 32
+    assert state.profiles[0].settings["rooms_text"] == "23612045"
 
 
 def test_cookie_profile_state_remembers_only_a_saved_profile() -> None:
@@ -85,6 +99,20 @@ def test_cookie_profile_state_remembers_only_a_saved_profile() -> None:
     state = load_cookie_profile_state(credential_store=store)
 
     assert state.last_selected_credential_id == "account-two"
+
+
+def test_legacy_profile_without_account_settings_remains_compatible() -> None:
+    store = MemoryCredentialStore()
+    profile = CookieProfile(
+        "旧版账号",
+        "cookie-one",
+        credential_id="account-one",
+    )
+
+    save_cookie_profiles([profile], credential_store=store)
+    state = load_cookie_profile_state(credential_store=store)
+
+    assert state.profiles[0].settings == {}
 
 
 def test_cookie_profile_state_ignores_unknown_last_selected_id() -> None:

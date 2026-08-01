@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 
 from bilibili_drops_miner.domain import TaskSnapshot
 
@@ -18,7 +17,7 @@ class AdaptiveConcurrencyController:
     def __init__(
         self,
         *,
-        task_started_at: datetime | None = None,
+        start_in_steady_mode: bool = False,
         catchup_sessions: int = 16,
         steady_sessions: int = 2,
         sample_window_seconds: float = 180.0,
@@ -30,8 +29,12 @@ class AdaptiveConcurrencyController:
         self.minimum_progress_delta = max(0.0, minimum_progress_delta)
         self._task_signature: tuple[str, ...] = ()
         self._settled = False
-        self._auto_new_task_candidate = task_started_at is not None
-        self._target = self._initial_target(task_started_at)
+        self._auto_new_task_candidate = start_in_steady_mode
+        self._target = (
+            self.steady_sessions
+            if start_in_steady_mode
+            else self.catchup_sessions
+        )
         self._evaluation_anchor: ProgressSample | None = None
         self._missing_progress_since: float | None = None
         self._status_detail = (
@@ -81,7 +84,10 @@ class AdaptiveConcurrencyController:
             self._missing_progress_since = None
             if is_new_task_set:
                 self._target = self.catchup_sessions
-                self._auto_new_task_candidate = True
+                # A task-id change inside an existing runtime does not prove
+                # that the 15-minute background guard started it. Only the
+                # explicit constructor signal may skip the catch-up trial.
+                self._auto_new_task_candidate = False
                 self._status_detail = (
                     "检测到下一组新任务，正在读取初始观看进度"
                 )
@@ -164,13 +170,6 @@ class AdaptiveConcurrencyController:
         self._settled = True
         self._target = self.steady_sessions
         self._status_detail = detail
-
-    def _initial_target(self, task_started_at: datetime | None) -> int:
-        return (
-            self.steady_sessions
-            if task_started_at is not None
-            else self.catchup_sessions
-        )
 
     @staticmethod
     def _watch_progress_minutes(snapshot: TaskSnapshot) -> float | None:

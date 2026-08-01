@@ -9,6 +9,7 @@ from typing import Literal
 from bilibili_drops_miner.config import MinerConfig
 from bilibili_drops_miner.miner import BilibiliWatchTimeMiner
 from bilibili_drops_miner.domain import RuntimeHealth, TaskSnapshot
+from bilibili_drops_miner.request_coordinator import AccountRequestCoordinator
 
 StopRequestResult = Literal[
     "not_running",
@@ -45,6 +46,8 @@ class WorkerController:
         logger: logging.Logger,
         on_health: Callable[[RuntimeHealth], None] | None = None,
         on_task_snapshot: Callable[[TaskSnapshot], None] | None = None,
+        on_rewards_settled: Callable[[tuple[str, ...]], None] | None = None,
+        request_coordinator: AccountRequestCoordinator | None = None,
     ) -> bool:
         self.stop_signal_set = False
         self._reset_stop_state()
@@ -55,6 +58,8 @@ class WorkerController:
             config,
             on_health=on_health,
             on_task_snapshot=on_task_snapshot,
+            on_rewards_settled=on_rewards_settled,
+            request_coordinator=request_coordinator,
         )
 
         def runner() -> None:
@@ -150,6 +155,11 @@ class WorkerController:
         if self.miner is None:
             return False
         return self.miner.set_target_sessions_per_room(target)
+
+    def force_fixed_sessions_per_room(self, target: int) -> bool:
+        if self.miner is None:
+            return False
+        return self.miner.force_fixed_sessions_per_room(target)
 
     def _reset_stop_state(self) -> None:
         self.stopping_in_progress = False

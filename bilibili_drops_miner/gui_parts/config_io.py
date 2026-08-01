@@ -13,6 +13,7 @@ from bilibili_drops_miner.credential_store import CredentialStore
 
 APP_SETTINGS_CREDENTIAL_ID = "application-settings"
 CONCURRENCY_POLICY_VERSION = 2
+SETTINGS_SCHEMA_VERSION = 5
 
 
 @dataclass(slots=True)
@@ -88,7 +89,6 @@ def build_config_payload(
         "thread_count": config.thread_count,
         "reconnect_delay_seconds": config.reconnect_delay_seconds,
         "enable_web_heartbeat": config.enable_web_heartbeat,
-        "task_ids": config.task_ids,
         "task_query_interval_seconds": config.task_query_interval_seconds,
         "notify_on_task_complete": config.notify_on_task_complete,
         "concurrency_mode": config.concurrency_mode,
@@ -99,6 +99,7 @@ def build_config_payload(
         "automatic_mining_enabled": automatic_mining_enabled,
         "apply_to_all_accounts": apply_to_all_accounts,
         "verbose": verbose,
+        "settings_schema_version": SETTINGS_SCHEMA_VERSION,
     }
     if include_secrets:
         payload["cookie"] = config.cookie

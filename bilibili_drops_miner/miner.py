@@ -16,6 +16,7 @@ from bilibili_drops_miner.config import MinerConfig
 from bilibili_drops_miner.domain import ApplicationState, RuntimeHealth, TaskSnapshot
 from bilibili_drops_miner.logging_utils import redact_sensitive_text
 from bilibili_drops_miner.notifier import MultiPlatformNotifier
+from bilibili_drops_miner.request_coordinator import AccountRequestCoordinator
 from bilibili_drops_miner.task_monitor import AccountTaskMonitor
 from bilibili_drops_miner.x25kn_worker import X25KnWorker
 
@@ -23,6 +24,7 @@ LOGGER = logging.getLogger(__name__)
 
 HealthCallback = Callable[[RuntimeHealth], None]
 TaskSnapshotCallback = Callable[[TaskSnapshot], None]
+RewardsSettledCallback = Callable[[tuple[str, ...]], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,10 +42,13 @@ class BilibiliWatchTimeMiner:
         *,
         on_health: HealthCallback | None = None,
         on_task_snapshot: TaskSnapshotCallback | None = None,
+        on_rewards_settled: RewardsSettledCallback | None = None,
+        request_coordinator: AccountRequestCoordinator | None = None,
     ) -> None:
         self.config = config
         self._on_health = on_health
         self._on_task_snapshot = on_task_snapshot
+        self._on_rewards_settled = on_rewards_settled
         self._thread_stop_event = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._async_stop_event: asyncio.Event | None = None
@@ -53,6 +58,9 @@ class BilibiliWatchTimeMiner:
         self._running = False
         self._health = RuntimeHealth()
         self._notifier = MultiPlatformNotifier(config.notify_urls)
+        self._request_coordinator = (
+            request_coordinator or AccountRequestCoordinator()
+        )
 
     @property
     def is_running(self) -> bool:
@@ -103,7 +111,10 @@ class BilibiliWatchTimeMiner:
         self._async_stop_event = asyncio.Event()
         if self.config.concurrency_mode == "automatic":
             self._adaptive_controller = AdaptiveConcurrencyController(
-                task_started_at=self.config.task_started_at,
+                start_in_steady_mode=(
+                    self.config.automatic_start_in_steady_mode
+                ),
+                catchup_sessions=self.config.thread_count,
             )
             sessions_per_room = self._adaptive_controller.target_sessions
             concurrency_phase = self._adaptive_controller.phase
@@ -142,6 +153,8 @@ class BilibiliWatchTimeMiner:
             config=self.config,
             account_label=account_label,
             on_snapshot=self._handle_task_snapshot,
+            on_rewards_settled=self._on_rewards_settled,
+            request_coordinator=self._request_coordinator,
         )
         monitor_task = asyncio.create_task(
             self._task_monitor.run(), name="account-task-monitor"
@@ -245,6 +258,29 @@ class BilibiliWatchTimeMiner:
             return False
         bounded = max(1, min(128, int(target)))
         loop.call_soon_threadsafe(self._resize_session_tasks, bounded)
+        return True
+
+    def force_fixed_sessions_per_room(self, target: int) -> bool:
+        """Switch a running miner to a fixed session count without restart."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return False
+        bounded = max(1, min(128, int(target)))
+
+        def apply() -> None:
+            self._adaptive_controller = None
+            self.config.concurrency_mode = "fixed"
+            self.config.thread_count = bounded
+            self._resize_session_tasks(bounded)
+            self._set_health(
+                concurrency_mode="fixed",
+                concurrency_phase="fixed",
+                concurrency_detail=(
+                    f"手动加速：每房间固定 {bounded} 个会话"
+                ),
+            )
+
+        loop.call_soon_threadsafe(apply)
         return True
 
     def claim_rewards(self) -> Future | None:
