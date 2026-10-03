@@ -1,5 +1,6 @@
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -7,6 +8,7 @@ from bilibili_drops_miner.credential_store import (
     JsonCredentialStore,
     MemoryCredentialStore,
 )
+from bilibili_drops_miner import credential_store as credential_store_module
 from bilibili_drops_miner.gui_parts.cookie_profiles import (
     COOKIE_PROFILE_METADATA_KEY,
     CookieProfile,
@@ -195,7 +197,7 @@ def test_failed_legacy_migration_preserves_original_file(
     monkeypatch,
 ) -> None:
     class FailingMetadataStore(MemoryCredentialStore):
-        def set_metadata(self, key: str, value) -> None:
+        def set_batch(self, credentials, metadata) -> None:
             raise OSError("synthetic metadata failure")
 
     executable = tmp_path / "bilibili-drops-miner-gui.exe"
@@ -237,3 +239,140 @@ def test_source_mode_migrates_cwd_legacy_file_to_appdata(
     assert "source-legacy-secret" not in cookie_store_path().read_text(
         encoding="utf-8"
     )
+
+
+def test_corrupt_legacy_file_does_not_hide_current_accounts(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    store = MemoryCredentialStore()
+    save_cookie_profiles([CookieProfile("saved", "synthetic-cookie", credential_id="saved")], credential_store=store)
+    original = store.get_metadata(COOKIE_PROFILE_METADATA_KEY)
+    legacy = tmp_path / "cookies.json"
+    legacy.write_text("{broken", encoding="utf-8")
+    state = load_cookie_profile_state(credential_store=store)
+    assert [profile.credential_id for profile in state.profiles] == ["saved"]
+    assert store.get_metadata(COOKIE_PROFILE_METADATA_KEY) == original
+    assert legacy.read_text(encoding="utf-8") == "{broken"
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_damaged_credential_keeps_other_profiles_and_marks_state_readonly(tmp_path, monkeypatch, missing):
+    monkeypatch.chdir(tmp_path)
+    class Store(MemoryCredentialStore):
+        def get(self, key):
+            if key == "broken":
+                if missing:
+                    return ""
+                raise OSError("cannot decrypt fixture")
+            return super().get(key)
+    store = Store()
+    store.set("valid", "synthetic-cookie")
+    metadata = {"accounts": [{"credential_id": "broken"}, {"credential_id": "valid"}]}
+    store.set_metadata(COOKIE_PROFILE_METADATA_KEY, metadata)
+    state = load_cookie_profile_state(credential_store=store)
+    assert [profile.credential_id for profile in state.profiles] == ["valid"]
+    assert state.load_error
+    assert store.get_metadata(COOKIE_PROFILE_METADATA_KEY) == metadata
+
+
+def test_incomplete_legacy_import_does_not_modify_existing_credentials(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    store = MemoryCredentialStore()
+    save_cookie_profiles(
+        [CookieProfile("current", "current-cookie", credential_id="account")],
+        credential_store=store,
+    )
+    original_metadata = store.get_metadata(COOKIE_PROFILE_METADATA_KEY)
+    legacy = tmp_path / "cookies.json"
+    legacy.write_text(json.dumps({"accounts": [
+        {"credential_id": "account", "cookie": "outdated-cookie"},
+        {"credential_id": "uncommitted", "cookie": "uncommitted-cookie"},
+        None,
+    ]}), encoding="utf-8")
+
+    state = load_cookie_profile_state(credential_store=store)
+
+    assert [profile.cookie for profile in state.profiles] == ["current-cookie"]
+    assert store.get("account") == "current-cookie"
+    assert store.get("uncommitted") == ""
+    assert store.get_metadata(COOKIE_PROFILE_METADATA_KEY) == original_metadata
+    assert legacy.exists()
+
+
+def test_explicit_legacy_import_is_read_only_until_saved(tmp_path):
+    store = MemoryCredentialStore()
+    store.set("account", "current-cookie")
+    source = tmp_path / "import.json"
+    source.write_text(json.dumps({"accounts": [
+        {"credential_id": "account", "cookie": "imported-cookie", "remark": "import"},
+    ]}), encoding="utf-8")
+
+    state = load_cookie_profile_state(source, credential_store=store)
+
+    assert state.profiles[0].cookie == "imported-cookie"
+    assert state.profiles[0].remark == "import"
+    assert not state.load_error
+    assert store.get("account") == "current-cookie"
+    save_cookie_profiles(state.profiles, credential_store=store)
+    assert store.get("account") == "imported-cookie"
+    assert source.exists()
+
+
+def test_failed_profile_commit_preserves_credentials_and_metadata_together(tmp_path, monkeypatch):
+    target = tmp_path / "credentials.json"
+    store = JsonCredentialStore(target)
+    save_cookie_profiles(
+        [CookieProfile("original", "original-cookie", credential_id="account")],
+        credential_store=store,
+        last_selected_credential_id="account",
+    )
+    original_bytes = target.read_bytes()
+    original_replace = credential_store_module.os.replace
+
+    def fail_replacement_metadata(source, destination):
+        payload = json.loads(Path(source).read_text(encoding="utf-8"))
+        accounts = payload["metadata"][COOKIE_PROFILE_METADATA_KEY]["accounts"]
+        if accounts[0]["remark"] == "replacement":
+            raise OSError("synthetic atomic replacement failure")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(credential_store_module.os, "replace", fail_replacement_metadata)
+    with pytest.raises(OSError, match="atomic replacement"):
+        save_cookie_profiles(
+            [CookieProfile("replacement", "replacement-cookie", credential_id="account")],
+            credential_store=store,
+            last_selected_credential_id="account",
+        )
+
+    assert target.read_bytes() == original_bytes
+    assert store.get("account") == "original-cookie"
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_profile_save_commits_all_credentials_and_metadata_in_one_replacement(tmp_path, monkeypatch):
+    target = tmp_path / "credentials.json"
+    store = JsonCredentialStore(target)
+    store.set("notification-urls", "unrelated-synthetic-secret")
+    store.set_metadata("unrelated", {"keep": True})
+    replacements = []
+    original_replace = credential_store_module.os.replace
+
+    def record_replace(source, destination):
+        replacements.append(destination)
+        original_replace(source, destination)
+
+    monkeypatch.setattr(credential_store_module.os, "replace", record_replace)
+    profiles = [
+        CookieProfile("first", "first-synthetic-cookie", credential_id="first"),
+        CookieProfile("second", "second-synthetic-cookie", credential_id="second"),
+    ]
+    save_cookie_profiles(profiles, credential_store=store, last_selected_credential_id="second")
+
+    assert len(replacements) == 1
+    assert store.get("first") == "first-synthetic-cookie"
+    assert store.get("second") == "second-synthetic-cookie"
+    assert store.get_metadata(COOKIE_PROFILE_METADATA_KEY)["last_selected_credential_id"] == "second"
+    assert store.get("notification-urls") == "unrelated-synthetic-secret"
+    assert store.get_metadata("unrelated") == {"keep": True}
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    assert "first-synthetic-cookie" not in target.read_text(encoding="utf-8")
+    assert payload["credentials"]["first"]["protected"] is (sys.platform == "win32")

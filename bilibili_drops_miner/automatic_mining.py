@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -42,7 +43,10 @@ def select_scheduled_task_group(
         if group.start_at <= now < group.end_at
     ]
     if current:
-        return ScheduledTaskSelection(current[0], "current", 15 * 60)
+        seconds_to_end = max(1, int((current[0].end_at - now).total_seconds()))
+        return ScheduledTaskSelection(
+            current[0], "current", min(15 * 60, seconds_to_end)
+        )
 
     future = sorted(
         (group for group in scheduled if group.start_at > now),
@@ -78,8 +82,28 @@ def select_scheduled_task_group(
     return ScheduledTaskSelection(None, "none", 15 * 60)
 
 
-def all_tasks_completed(snapshot: TaskSnapshot) -> bool:
+def _has_expected_task_coverage(
+    snapshot: TaskSnapshot,
+    expected_task_ids: Iterable[str] | None,
+) -> bool:
     if snapshot.error or not snapshot.progresses:
+        return False
+    if expected_task_ids is not None:
+        expected = {
+            task_id.strip() for task_id in expected_task_ids if task_id.strip()
+        }
+        returned = [task.task_id for task in snapshot.progresses]
+        if len(returned) != len(expected) or set(returned) != expected:
+            return False
+    return True
+
+
+def all_tasks_completed(
+    snapshot: TaskSnapshot,
+    *,
+    expected_task_ids: Iterable[str] | None = None,
+) -> bool:
+    if not _has_expected_task_coverage(snapshot, expected_task_ids):
         return False
     for task in snapshot.progresses:
         checkpoints = list(task.check_points or [])
@@ -91,8 +115,12 @@ def all_tasks_completed(snapshot: TaskSnapshot) -> bool:
     return True
 
 
-def all_task_rewards_claimed(snapshot: TaskSnapshot) -> bool:
-    if snapshot.error or not snapshot.progresses:
+def all_task_rewards_claimed(
+    snapshot: TaskSnapshot,
+    *,
+    expected_task_ids: Iterable[str] | None = None,
+) -> bool:
+    if not _has_expected_task_coverage(snapshot, expected_task_ids):
         return False
     for task in snapshot.progresses:
         checkpoints = list(task.check_points or [])

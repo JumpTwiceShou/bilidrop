@@ -18,6 +18,19 @@ Bilibili home page, and waited for the user to visit a live room. It parsed rend
 task groups or intercepted the `totalv2` response. The v2 discovery service now performs
 the direct room-data request first and parses both the current nested
 `__BILIACT_EVAPAGEDATA__` component tree and the legacy flat `__initialState` structure.
+`task_page_fetcher.py` reuses one HTTP session within each discovery, retries a
+transient request failure once, and follows activity links from embedded room
+configuration or iframes. The HTTP path checks at most three pages and sends at most
+six requests, including redirects and retries. The direct-discovery deadline is
+checked before requests, between streamed response chunks, and before accepting
+parsed task data; network idle waits also have HTTPX timeouts. Only Bilibili URLs
+are followed, redirects are validated before requesting
+them, and login Cookies are scoped to that domain. If a login Cookie is rejected,
+published task pages are retried anonymously without changing the saved account.
+Activity data is scoped to the requested room; explicit conflicting room IDs and
+recommended-room/advertisement data are excluded, while confirmed short-ID aliases
+are retained.
+Direct success returns before browser detection or WebDriver startup.
 Room live state is checked only after direct task data is absent, so it cannot hide an
 offline room's published activity tasks. The fully hidden browser path is a bounded
 fallback, the visible flow retains `totalv2` interception, and the GUI exposes
@@ -62,7 +75,8 @@ settings and can be changed later in Advanced Settings.
 - `config.py` and `utils.py`: validated configuration and dedicated input parsing.
 - `miner.py`: one managed asyncio runtime and bounded room/session tasks.
 - `task_monitor.py`: one account-level task poller, notifier and reward coordinator.
-- `task_discovery.py`: room-driven headless discovery with structured outcomes.
+- `task_discovery.py`: HTTP-first task discovery with structured outcomes and browser fallbacks.
+- `task_page_fetcher.py`: bounded requests to room and linked activity pages.
 - `credential_store.py`: protected credential persistence and legacy migration.
 - `gui_parts/`: Qt presentation, account workspaces, controllers and explicit run/discovery state.
 
@@ -73,3 +87,25 @@ settings, diagnostics, tests or logs.
 Room IDs and a Cookie are the runtime prerequisites. Task IDs are optional metadata:
 without them, watch-heartbeat sessions still run while task polling, completion
 notifications and reward claiming remain inactive.
+
+## Integrity and cancellation
+
+Discovery uses the same schedule selection as automatic mining, including when a
+cached page crosses a task boundary. Each GUI discovery owns a cancellation event;
+queued callbacks recheck that event and attempt identity before applying results.
+Account switches invalidate discovery even while a runtime is already running.
+The visible fallback validates room identity and known aliases, opens the target
+room directly, and accepts only the first successful capture path.
+
+Progress responses must cover exactly the requested task IDs before they reach
+completion or adaptive-concurrency decisions. The account monitor invalidates
+cached progress and outstanding claims when tasks change. Claim requests reserve
+their generation in event-loop submission order, and caller cancellation propagates
+to the batch. Results are associated by task ID; ambiguous checkpoints cannot be
+marked claimed by positional inference. Final-claim UI callbacks also verify the
+task set and runtime identity before stopping a completed run.
+
+Profile parsing is read-only. Built-in credential stores commit account credentials
+and profile metadata as one batch; the Windows store retains DPAPI and performs one
+atomic file replacement. Partially loaded profiles cannot replace the original
+metadata. Exit-time persistence errors do not skip stopping account runtimes.

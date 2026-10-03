@@ -505,7 +505,14 @@ class BilibiliClient:
             },
             retry_on_wbi_miss=True,
         )
-        return parse_task_progress_payload(payload)
+        progresses = parse_task_progress_payload(payload)
+        returned_ids = [task.task_id for task in progresses]
+        if (
+            len(returned_ids) != len(normalized_ids)
+            or set(returned_ids) != set(normalized_ids)
+        ):
+            raise ValueError("任务进度响应不完整或任务 ID 不匹配，请稍后重试")
+        return progresses
 
     async def get_mission_reward_info(self, task_id: str) -> MissionRewardInfo:
         normalized_id = normalize_task_id(task_id)

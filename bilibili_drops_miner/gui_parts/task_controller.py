@@ -97,7 +97,6 @@ class TaskController:
 
         def _do() -> None:
             result_text = ""
-            refresh_after = False
             try:
 
                 async def _query() -> tuple[list[LiveWatchTime], list[str]]:
@@ -176,9 +175,7 @@ class TaskController:
         with self._task_refresh_lock:
             if self._task_refresh_inflight:
                 self._task_refresh_queued = True
-                logging.getLogger(__name__).info(
-                    "任务刷新正在进行，已排队下一次刷新"
-                )
+                logging.getLogger(__name__).info("任务刷新正在进行，已排队下一次刷新")
                 return
             self._task_refresh_inflight = True
 
@@ -186,7 +183,6 @@ class TaskController:
 
         def _do() -> None:
             result_text = ""
-            refresh_after = False
             permit = self._request_coordinator.try_begin(
                 "task-refresh",
                 group=TASK_API_GROUP,
@@ -194,7 +190,6 @@ class TaskController:
             try:
                 if permit is None:
                     result_text = "账号任务请求正在执行或冷却中，稍后自动刷新"
-                    refresh_after = True
                     return
 
                 async def _query():
@@ -208,11 +203,11 @@ class TaskController:
                     return await asyncio.wait_for(_query(), timeout=45)
 
                 progresses = asyncio.run(_query_with_timeout())
-                self._latest_task_progresses = list(progresses)
-                self._apply_known_claimed_statuses(progresses)
                 self._post_ui_task(
-                    self._set_task_snapshot,
-                    TaskSnapshot(progresses=tuple(progresses)),
+                    self._publish_progress,
+                    cookie,
+                    task_ids,
+                    progresses,
                 )
             except Exception as exc:
                 logging.getLogger(__name__).warning("刷新任务失败: %s", exc)
@@ -229,7 +224,12 @@ class TaskController:
                     if self._task_refresh_queued:
                         rerun = True
                         self._task_refresh_queued = False
-                self._post_ui_task(self._complete_task_refresh, result_text, rerun)
+
+                def complete() -> None:
+                    current = self._selection_matches(cookie, task_ids)
+                    self._complete_task_refresh(result_text if current else "", rerun)
+
+                self._post_ui_task(complete)
 
         threading.Thread(target=_do, daemon=True, name="gui-task-refresh").start()
 
@@ -278,12 +278,15 @@ class TaskController:
                     client = BilibiliClient(cookie)
                     try:
                         progresses = await client.get_task_progress(task_ids)
+                        if not self._selection_matches(cookie, task_ids):
+                            return [], []
                         claim_ids = [
                             claim_task_id
                             for _marker_id, claim_task_id, progress in (
                                 self._completed_progress_units(progresses)
                             )
-                            if bool(getattr(progress, "is_claimable", False))
+                            if claim_task_id
+                            and bool(getattr(progress, "is_claimable", False))
                         ]
                         if not claim_ids:
                             return progresses, []
@@ -293,9 +296,16 @@ class TaskController:
                         await client.close()
 
                 progresses, results = asyncio.run(_claim())
-                self._latest_task_progresses = list(progresses)
-                self._apply_known_claimed_statuses(progresses)
-                self._record_claim_results(results)
+                if not self._selection_matches(cookie, task_ids):
+                    return
+
+                def remember_claims() -> None:
+                    if self._selection_matches(cookie, task_ids):
+                        self._latest_task_progresses = list(progresses)
+                        self._apply_known_claimed_statuses(progresses)
+                        self._record_claim_results(results)
+
+                self._post_ui_task(remember_claims)
                 result_text = format_reward_claim_results(results)
                 refresh_after = True
             except Exception as exc:
@@ -311,12 +321,30 @@ class TaskController:
                     self._reward_claim_inflight = False
                 if result_text:
                     logging.getLogger(__name__).info("领取奖励结果:\n%s", result_text)
-                if refresh_after:
-                    self._post_ui_task(self.refresh, manual=False)
-                else:
-                    self._post_ui_task(self._set_task_progress_text, result_text)
+
+                def finish() -> None:
+                    if not self._selection_matches(cookie, task_ids):
+                        return
+                    if refresh_after:
+                        self.refresh(manual=False)
+                    else:
+                        self._set_task_progress_text(result_text)
+
+                self._post_ui_task(finish)
 
         threading.Thread(target=_do, daemon=True, name="gui-reward-claim").start()
+
+    def _selection_matches(self, cookie: str, task_ids: list[str]) -> bool:
+        return cookie == self._get_cookie().strip() and set(task_ids) == set(
+            self._get_task_ids()
+        )
+
+    def _publish_progress(self, cookie, task_ids, progresses) -> None:
+        if not self._selection_matches(cookie, task_ids):
+            return
+        self._latest_task_progresses = list(progresses)
+        self._apply_known_claimed_statuses(progresses)
+        self._set_task_snapshot(TaskSnapshot(progresses=tuple(progresses)))
 
     @staticmethod
     def _completed_progress_units(progresses):
@@ -331,7 +359,10 @@ class TaskController:
                     units.append(
                         (
                             f"{task.task_id}:checkpoint:{point_id}",
-                            str(getattr(point, "sid", "") or task.task_id).strip(),
+                            str(
+                                getattr(point, "sid", "")
+                                or (task.task_id if len(checkpoints) == 1 else "")
+                            ).strip(),
                             point,
                         )
                     )
@@ -353,9 +384,7 @@ class TaskController:
             if not bool(getattr(result, "success", False)):
                 continue
             task_id = str(getattr(result, "task_id", "") or "").strip()
-            reward_name = str(
-                getattr(result, "reward_name", "") or ""
-            ).strip()
+            reward_name = str(getattr(result, "reward_name", "") or "").strip()
             candidates = [
                 unit
                 for unit in units
@@ -368,12 +397,11 @@ class TaskController:
                 unit
                 for unit in candidates
                 if reward_name
-                and str(getattr(unit[2], "award_name", "") or "").strip()
-                == reward_name
+                and str(getattr(unit[2], "award_name", "") or "").strip() == reward_name
             ]
-            selected = max(
-                matched or candidates,
-                key=lambda unit: float(getattr(unit[2], "limit_value", 0) or 0),
-            )
+            identifiable = matched or candidates
+            if len(identifiable) != 1:
+                continue
+            selected = identifiable[0]
             self._claimed_completion_ids.add(selected[0])
             selected[2].status = 3

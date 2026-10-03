@@ -4,7 +4,8 @@ import asyncio
 import logging
 import threading
 from collections.abc import Callable
-from concurrent.futures import Future
+from concurrent.futures import CancelledError as FutureCancelledError
+from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass, replace
 from time import monotonic, time
 
@@ -85,7 +86,6 @@ class BilibiliWatchTimeMiner:
         if self._running:
             raise RuntimeError("miner 已在运行")
         self.config.validate()
-        self._thread_stop_event.clear()
         self._running = True
         failure = ""
         try:
@@ -100,6 +100,7 @@ class BilibiliWatchTimeMiner:
             self._session_tasks = {}
             self._adaptive_controller = None
             self._running = False
+            self._thread_stop_event.clear()
             self._set_health(
                 state=ApplicationState.ERROR if failure else ApplicationState.IDLE,
                 active_sessions=0,
@@ -109,6 +110,9 @@ class BilibiliWatchTimeMiner:
     async def _run_async(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._async_stop_event = asyncio.Event()
+        if self._thread_stop_event.is_set():
+            self._async_stop_event.set()
+            return
         if self.config.concurrency_mode == "automatic":
             self._adaptive_controller = AdaptiveConcurrencyController(
                 start_in_steady_mode=(
@@ -122,9 +126,7 @@ class BilibiliWatchTimeMiner:
         else:
             sessions_per_room = self.config.thread_count
             concurrency_phase = "fixed"
-            concurrency_detail = (
-                f"固定并发：每房间 {sessions_per_room} 个会话"
-            )
+            concurrency_detail = f"固定并发：每房间 {sessions_per_room} 个会话"
         plans = self._build_session_plans(sessions_per_room)
         self._set_health(
             state=ApplicationState.STARTING,
@@ -138,6 +140,8 @@ class BilibiliWatchTimeMiner:
         )
 
         uid, uname = await self._probe_login()
+        if self._thread_stop_event.is_set():
+            return
         if uid:
             LOGGER.info("登录成功: %s (UID: %s)", uname, uid)
         else:
@@ -208,9 +212,7 @@ class BilibiliWatchTimeMiner:
             await worker.run_forever()
         finally:
             await client.close()
-            self._set_health(
-                active_sessions=max(0, self._health.active_sessions - 1)
-            )
+            self._set_health(active_sessions=max(0, self._health.active_sessions - 1))
 
     async def _wait_or_stop(self, timeout: float) -> bool:
         if self._async_stop_event is None:
@@ -222,7 +224,9 @@ class BilibiliWatchTimeMiner:
             return False
 
     def stop(self, *, force: bool = False) -> None:
-        del force  # cancellation is deterministic; force is retained for API compatibility
+        del (
+            force
+        )  # cancellation is deterministic; force is retained for API compatibility
         self._thread_stop_event.set()
         loop = self._loop
         stop_event = self._async_stop_event
@@ -246,8 +250,7 @@ class BilibiliWatchTimeMiner:
             return False
 
         def apply() -> None:
-            self.config.task_ids = list(task_ids)
-            monitor.request_refresh()
+            monitor.update_task_ids(task_ids)
 
         loop.call_soon_threadsafe(apply)
         return True
@@ -284,21 +287,57 @@ class BilibiliWatchTimeMiner:
         return True
 
     def claim_rewards(self) -> Future | None:
-        loop = self._loop
-        monitor = self._task_monitor
-        if loop is None or monitor is None or not loop.is_running():
-            return None
-        return asyncio.run_coroutine_threadsafe(monitor.claim_rewards(), loop)
+        return self._submit_monitor_claim("claim_rewards")
 
     def claim_reward_task_ids(self, task_ids: list[str]) -> Future | None:
+        return self._submit_monitor_claim("claim_reward_task_ids", list(task_ids))
+
+    def _submit_monitor_claim(self, method: str, *args) -> Future | None:
         loop = self._loop
         monitor = self._task_monitor
         if loop is None or monitor is None or not loop.is_running():
             return None
-        return asyncio.run_coroutine_threadsafe(
-            monitor.claim_reward_task_ids(task_ids),
-            loop,
-        )
+        result = Future()
+
+        def submit() -> None:
+            if result.cancelled():
+                return
+            # Reserve the generation in queue order, before the coroutine gets
+            # its first turn. A later queued task update must invalidate it.
+            pending = asyncio.run_coroutine_threadsafe(
+                getattr(monitor, method)(
+                    *args, expected_generation=monitor.task_generation
+                ),
+                loop,
+            )
+
+            def complete(future) -> None:
+                if result.cancelled():
+                    return
+                try:
+                    error = future.exception()
+                except FutureCancelledError:
+                    result.cancel()
+                    return
+                try:
+                    if error is not None:
+                        result.set_exception(error)
+                    else:
+                        result.set_result(future.result())
+                except InvalidStateError:
+                    # Cancellation can race completion from the GUI thread.
+                    if not result.cancelled():
+                        raise
+
+            def cancel_pending(future) -> None:
+                if future.cancelled():
+                    pending.cancel()
+
+            pending.add_done_callback(complete)
+            result.add_done_callback(cancel_pending)
+
+        loop.call_soon_threadsafe(submit)
+        return result
 
     def update_cookie(self, new_cookie: str) -> None:
         if self._running:

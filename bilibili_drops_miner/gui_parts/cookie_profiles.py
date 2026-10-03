@@ -36,6 +36,7 @@ class CookieProfile:
 class CookieProfileState:
     profiles: list[CookieProfile]
     last_selected_credential_id: str = ""
+    load_error: str = ""
 
 
 def cookie_store_path() -> Path:
@@ -92,17 +93,24 @@ def _state_from_payload(
         raise ValueError("Cookie 档案必须是列表或包含 accounts/cookies 列表的对象")
 
     profiles: list[CookieProfile] = []
+    errors: list[str] = []
     for raw in raw_profiles:
         if not isinstance(raw, dict):
+            errors.append("账号条目格式错误")
             continue
         legacy_cookie = str(raw.get("cookie", "")).strip()
         credential_id = str(raw.get("credential_id", "")).strip()
         if legacy_cookie and not credential_id:
             credential_id = _legacy_credential_id(legacy_cookie)
-        if legacy_cookie:
-            credential_store.set(credential_id, legacy_cookie)
-        cookie = credential_store.get(credential_id) if credential_id else ""
+        try:
+            cookie = legacy_cookie or (
+                credential_store.get(credential_id) if credential_id else ""
+            )
+        except Exception as exc:
+            errors.append(f"账号凭据读取失败（{type(exc).__name__}）")
+            continue
         if not cookie:
+            errors.append("账号凭据缺失")
             continue
         profiles.append(
             CookieProfile(
@@ -126,7 +134,7 @@ def _state_from_payload(
         for profile in profiles
     ):
         last_selected_credential_id = ""
-    return CookieProfileState(profiles, last_selected_credential_id)
+    return CookieProfileState(profiles, last_selected_credential_id, "；".join(errors))
 
 
 def _metadata_state(credential_store: CredentialStore) -> CookieProfileState:
@@ -226,11 +234,20 @@ def load_cookie_profile_state(
 
     store = credential_store or JsonCredentialStore()
     current = _metadata_state(store)
+    if current.load_error:
+        return current
     legacy_path = legacy_cookie_store_path()
     if not legacy_path.exists():
         return current
 
-    legacy = _read_legacy_state(legacy_path, store)
+    try:
+        legacy = _read_legacy_state(legacy_path, store)
+    except (OSError, ValueError) as exc:
+        LOGGER.warning("旧版账号文件读取失败，已保留原文件并使用现有账号（%s）", type(exc).__name__)
+        return current
+    if legacy.load_error:
+        LOGGER.warning("旧版账号迁移不完整，已保留原文件: %s", legacy.load_error)
+        return current
     merged = _merge_states(current, legacy)
     save_cookie_profiles(
         merged.profiles,
@@ -262,12 +279,10 @@ def save_cookie_profiles(
         store = JsonCredentialStore(Path(path) if path is not None else None)
 
     accounts: list[dict[str, str]] = []
+    credentials: dict[str, str] = {}
     for profile in profiles:
         credential_id = profile.credential_id or f"cookie-{uuid.uuid4().hex}"
-        store.set(credential_id, profile.cookie)
-        if store.get(credential_id) != profile.cookie:
-            raise OSError(f"Cookie 凭据校验失败: {profile.remark}")
-        profile.credential_id = credential_id
+        credentials[credential_id] = profile.cookie
         accounts.append(
             {
                 "remark": profile.remark,
@@ -292,6 +307,11 @@ def save_cookie_profiles(
         "last_selected_credential_id": selected_id,
         "accounts": accounts,
     }
-    store.set_metadata(COOKIE_PROFILE_METADATA_KEY, expected)
+    store.set_batch(credentials, {COOKIE_PROFILE_METADATA_KEY: expected})
+    for credential_id, cookie in credentials.items():
+        if store.get(credential_id) != cookie:
+            raise OSError("Cookie 凭据写入校验失败")
     if store.get_metadata(COOKIE_PROFILE_METADATA_KEY) != expected:
         raise OSError("Cookie 档案元数据写入校验失败")
+    for profile, account in zip(profiles, accounts):
+        profile.credential_id = account["credential_id"]

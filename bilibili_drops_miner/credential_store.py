@@ -39,6 +39,17 @@ class CredentialStore(ABC):
     def set_metadata(self, key: str, value) -> None:
         raise NotImplementedError
 
+    def set_batch(
+        self,
+        credentials: dict[str, str],
+        metadata: dict[str, object],
+    ) -> None:
+        """Compatibility fallback; stores may override with an atomic commit."""
+        for credential_id, secret in credentials.items():
+            self.set(credential_id, secret)
+        for key, value in metadata.items():
+            self.set_metadata(key, value)
+
 
 class MemoryCredentialStore(CredentialStore):
     def __init__(self) -> None:
@@ -59,6 +70,16 @@ class MemoryCredentialStore(CredentialStore):
 
     def set_metadata(self, key: str, value) -> None:
         self._metadata[key] = copy.deepcopy(value)
+
+    def set_batch(
+        self,
+        credentials: dict[str, str],
+        metadata: dict[str, object],
+    ) -> None:
+        values = {**self._values, **credentials}
+        updated_metadata = copy.deepcopy(self._metadata)
+        updated_metadata.update(copy.deepcopy(metadata))
+        self._values, self._metadata = values, updated_metadata
 
 
 class _DataBlob(ctypes.Structure):
@@ -116,18 +137,21 @@ class JsonCredentialStore(CredentialStore):
         if not credential_id.strip():
             raise ValueError("credential_id 不能为空")
         payload = self._read()
+        payload.setdefault("credentials", {})[credential_id] = self._encode_secret(secret)
+        self._write(payload)
+        if self.get(credential_id) != secret:
+            raise OSError("凭据写入校验失败")
+
+    def _encode_secret(self, secret: str) -> dict[str, object]:
         raw = secret.encode("utf-8")
         if self.protected:
             raw = _dpapi_transform(raw, protect=True)
         else:
             LOGGER.warning("当前平台没有 DPAPI，凭据回退为独立本地存储")
-        payload.setdefault("credentials", {})[credential_id] = {
+        return {
             "protected": self.protected,
             "value": base64.b64encode(raw).decode("ascii"),
         }
-        self._write(payload)
-        if self.get(credential_id) != secret:
-            raise OSError("凭据写入校验失败")
 
     def delete(self, credential_id: str) -> None:
         payload = self._read()
@@ -151,6 +175,27 @@ class JsonCredentialStore(CredentialStore):
             metadata = {}
             payload["metadata"] = metadata
         metadata[key] = copy.deepcopy(value)
+        payload["version"] = max(int(payload.get("version") or 1), 2)
+        self._write(payload)
+
+    def set_batch(
+        self,
+        credentials: dict[str, str],
+        metadata: dict[str, object],
+    ) -> None:
+        if any(not credential_id.strip() for credential_id in credentials):
+            raise ValueError("credential_id 不能为空")
+        if any(not key.strip() for key in metadata):
+            raise ValueError("metadata key 不能为空")
+        payload = self._read()
+        protected_credentials = {
+            credential_id: self._encode_secret(secret)
+            for credential_id, secret in credentials.items()
+        }
+        payload.setdefault("credentials", {}).update(protected_credentials)
+        if not isinstance(payload.get("metadata"), dict):
+            payload["metadata"] = {}
+        payload["metadata"].update(copy.deepcopy(metadata))
         payload["version"] = max(int(payload.get("version") or 1), 2)
         self._write(payload)
 

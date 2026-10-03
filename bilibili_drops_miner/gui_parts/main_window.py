@@ -41,7 +41,6 @@ from bilibili_drops_miner.desktop_runtime import SingleInstanceGuard
 from bilibili_drops_miner.domain import ApplicationState, RuntimeHealth, TaskSnapshot
 from bilibili_drops_miner.gui_parts.app_style import configure_qt_app
 from bilibili_drops_miner.gui_parts.account_sessions import (
-    DEFAULT_DISCOVERY_HINT,
     AccountWorkspace,
     LoginState,
 )
@@ -456,17 +455,13 @@ class MinerGUI(QMainWindow):
         session.notify_on_task_complete = settings.notify_on_task_complete
         session.concurrency_mode = settings.concurrency_mode
 
-    def _sync_cookie_profile_settings(self) -> None:
-        for profile in self._cookie_profiles:
+    def _sync_cookie_profile_settings(self, profiles: list[CookieProfile]) -> None:
+        for profile in profiles:
             session = next(
                 (
                     item
                     for item in self._account_sessions.values()
-                    if (
-                        item.credential_id
-                        and item.credential_id == profile.credential_id
-                    )
-                    or item.cookie == profile.cookie
+                    if item.cookie == profile.cookie
                 ),
                 None,
             )
@@ -530,6 +525,7 @@ class MinerGUI(QMainWindow):
         session_id: str,
         *,
         remember_saved: bool = True,
+        preserve_account_fields: bool = False,
     ) -> None:
         if session_id not in self._account_sessions:
             return
@@ -537,7 +533,11 @@ class MinerGUI(QMainWindow):
             self._refresh_cookie_profile_combo(selected_session_id=session_id)
             self._restore_active_session()
             return
-        self._capture_active_session()
+        self.browser_actions.cancel_discovery()
+        if self._application_state == ApplicationState.DISCOVERING:
+            self._pending_start_after_discovery = False
+            self._set_discovery_status("任务识别已取消", False)
+        self._capture_active_session(preserve_account_fields=preserve_account_fields)
         self._active_session_id = session_id
         session = self._active_session
         if remember_saved and not session.temporary and session.credential_id:
@@ -678,6 +678,7 @@ class MinerGUI(QMainWindow):
     # ---------- cookie profiles ----------
 
     def _load_cookie_profiles(self) -> None:
+        self._cookie_profiles_writable = False
         try:
             state = load_cookie_profile_state(
                 credential_store=self._credential_store
@@ -686,6 +687,11 @@ class MinerGUI(QMainWindow):
             self._last_selected_credential_id = (
                 state.last_selected_credential_id
             )
+            self._cookie_profiles_writable = not state.load_error
+            if state.load_error:
+                logging.getLogger(__name__).warning(
+                    "部分账号档案加载失败，已禁止覆盖原档案: %s", state.load_error
+                )
         except Exception as exc:
             self._cookie_profiles = []
             self._last_selected_credential_id = ""
@@ -842,14 +848,26 @@ class MinerGUI(QMainWindow):
             self._credential_store.delete("notification-urls")
 
     def _write_cookie_profiles(self) -> None:
-        self._sync_cookie_profile_settings()
+        if not self._cookie_profiles_writable:
+            raise OSError("账号档案加载失败，已保留原档案；请修复后重新打开程序")
+        profiles = [
+            replace(profile, settings=dict(profile.settings))
+            for profile in self._cookie_profiles
+        ]
+        self._sync_cookie_profile_settings(profiles)
         save_cookie_profiles(
-            self._cookie_profiles,
+            profiles,
             credential_store=self._credential_store,
             last_selected_credential_id=self._last_selected_credential_id,
         )
+        self._cookie_profiles = profiles
 
     def _backup_cookie_profiles(self, reason: str) -> bool:
+        if not self._cookie_profiles_writable:
+            self._show_error(
+                "账号档案加载失败", "原档案已保留，请修复后重新打开程序再保存或删除账号。"
+            )
+            return False
         store = self._credential_store
         backup = getattr(store, "backup", None)
         if not callable(backup):
@@ -957,7 +975,9 @@ class MinerGUI(QMainWindow):
         cookie = cookie.strip()
         existing = self._session_for_cookie(cookie) if cookie else None
         if existing is not None and existing.session_id != self._active_session_id:
-            self._activate_account_session(existing.session_id)
+            self._activate_account_session(
+                existing.session_id, preserve_account_fields=True
+            )
             return existing
 
         current = self._active_session
@@ -974,7 +994,9 @@ class MinerGUI(QMainWindow):
             current = self._register_account_session(
                 AccountWorkspace.temporary_account(cookie=cookie)
             )
-            self._activate_account_session(current.session_id, remember_saved=False)
+            self._activate_account_session(
+                current.session_id, remember_saved=False, preserve_account_fields=True
+            )
         else:
             current.cookie = cookie
             self.cookie_edit.setText(cookie)
@@ -1017,11 +1039,10 @@ class MinerGUI(QMainWindow):
 
     def _prompt_save_new_cookie(self, cookie: str | None = None) -> None:
         cookie = (cookie if cookie is not None else self.cookie_edit.text()).strip()
+        session = self._adopt_cookie_for_active_session(cookie)
         if not cookie:
-            self._active_session.cookie = ""
             self._refresh_cookie_profile_combo()
             return
-        session = self._adopt_cookie_for_active_session(cookie)
         if not session.remark:
             session.remark = self.cookie_remark_edit.text().strip()
         if not session.temporary or cookie == self._last_prompted_cookie:
@@ -1075,6 +1096,8 @@ class MinerGUI(QMainWindow):
         self._activate_account_session(session_id)
 
     def save_cookie_profile(self) -> None:
+        from uuid import uuid4
+
         self._capture_active_session()
         session = self._active_session
         cookie = self.cookie_edit.text().strip()
@@ -1086,7 +1109,7 @@ class MinerGUI(QMainWindow):
             remark=remark,
             cookie=cookie,
             updated_at=now_text(),
-            credential_id=session.credential_id,
+            credential_id=session.credential_id or f"cookie-{uuid4().hex}",
             settings=self._account_settings_from_session(session).to_mapping(),
         )
 
@@ -1112,6 +1135,7 @@ class MinerGUI(QMainWindow):
                 profile.credential_id = existing.credential_id
 
         old_profiles = list(self._cookie_profiles)
+        old_last_selected = self._last_selected_credential_id
         if not self._backup_cookie_profiles(
             "overwrite" if target_index is not None else "save"
         ):
@@ -1124,29 +1148,29 @@ class MinerGUI(QMainWindow):
         try:
             self._last_selected_credential_id = profile.credential_id
             self._write_cookie_profiles()
-            session.cookie = cookie
-            session.remark = remark
-            session.credential_id = profile.credential_id
-            session.temporary = False
-            session.account_settings_saved = True
-            self._last_selected_credential_id = profile.credential_id
-            # 第一次保存时 credential_id 由存储层生成，需要再写一次才能记录“最近使用”。
-            self._write_cookie_profiles()
-            if (
-                overwritten_session is not None
-                and overwritten_session.session_id != session.session_id
-            ):
-                self._account_sessions.pop(overwritten_session.session_id, None)
-                self._automatic_mining_session_ids.discard(
-                    overwritten_session.session_id
-                )
-            self.cookie_remark_edit.setText(remark)
-            self._refresh_cookie_profile_combo(selected_session_id=session.session_id)
-            self._last_prompted_cookie = ""
-            logging.getLogger(__name__).info("Cookie已保存到 %s", cookie_store_path())
         except Exception as exc:
             self._cookie_profiles = old_profiles
+            self._last_selected_credential_id = old_last_selected
             self._show_error("保存Cookie失败", str(exc))
+            return
+
+        session.cookie = cookie
+        session.remark = remark
+        session.credential_id = profile.credential_id
+        session.temporary = False
+        session.account_settings_saved = True
+        if (
+            overwritten_session is not None
+            and overwritten_session.session_id != session.session_id
+        ):
+            self._account_sessions.pop(overwritten_session.session_id, None)
+            self._automatic_mining_session_ids.discard(
+                overwritten_session.session_id
+            )
+        self.cookie_remark_edit.setText(remark)
+        self._refresh_cookie_profile_combo(selected_session_id=session.session_id)
+        self._last_prompted_cookie = ""
+        logging.getLogger(__name__).info("Cookie已保存到 %s", cookie_store_path())
 
     def delete_cookie_profile(self) -> None:
         self._capture_active_session()
@@ -1374,6 +1398,8 @@ class MinerGUI(QMainWindow):
         session.run_owner = RunOwner.AUTO if automatic else RunOwner.MANUAL
         if automatic:
             session.automation_state = AutomationState.AUTO_RUNNING
+        session.runtime_generation += 1
+        runtime_generation = session.runtime_generation
         try:
             started = session.controller.start(
                 config,
@@ -1388,6 +1414,7 @@ class MinerGUI(QMainWindow):
                     self._stop_runtime_after_rewards_claimed,
                     session_id,
                     task_ids,
+                    runtime_generation,
                 ),
                 request_coordinator=session.request_coordinator,
             )
@@ -1958,7 +1985,9 @@ class MinerGUI(QMainWindow):
                         )
                         if (
                             not runtime_running
-                            and all_tasks_completed(snapshot)
+                            and all_tasks_completed(
+                                snapshot, expected_task_ids=selection.group.task_ids
+                            )
                         ):
                             claim_ids = claimable_reward_task_ids(snapshot)
                             if claim_ids:
@@ -1967,22 +1996,26 @@ class MinerGUI(QMainWindow):
                                         claim_ids
                                     )
                                 )
-                                for claim_id, claim_result in zip(
-                                    claim_ids,
-                                    claim_results,
-                                ):
-                                    if not bool(
-                                        getattr(
-                                            claim_result,
-                                            "success",
-                                            False,
-                                        )
+                                for claim_id in claim_ids:
+                                    matching_results = [
+                                        result for result in claim_results
+                                        if getattr(result, "task_id", "") == claim_id
+                                    ]
+                                    if len(matching_results) != 1 or not bool(
+                                        getattr(matching_results[0], "success", False)
                                     ):
                                         continue
+                                    matching_units = []
                                     for task in progresses:
-                                        for point in task.check_points or []:
-                                            if point.sid == claim_id:
-                                                point.status = 3
+                                        if task.check_points:
+                                            matching_units.extend(
+                                                point for point in task.check_points
+                                                if point.sid == claim_id
+                                            )
+                                        elif task.task_id == claim_id:
+                                            matching_units.append(task)
+                                    if len(matching_units) == 1:
+                                        matching_units[0].status = 3
                         return progresses, room_info.live_status
                     finally:
                         await client.close()
@@ -2156,7 +2189,7 @@ class MinerGUI(QMainWindow):
             session.login_state = LoginState.VALID
         if session.session_id == self._active_session_id:
             self._render_task_snapshot(result.snapshot)
-        if all_tasks_completed(result.snapshot):
+        if all_tasks_completed(result.snapshot, expected_task_ids=group.task_ids):
             session.task_phase = TaskPhase.COMPLETED
             claim_ids = claimable_reward_task_ids(result.snapshot)
             session.automation_state = (
@@ -2315,15 +2348,21 @@ class MinerGUI(QMainWindow):
         logger = logging.getLogger(__name__)
         needs_poll = False
         for session in tuple(self._account_sessions.values()):
-            session.task_controller.stop_live_watch_time()
-            result = session.controller.request_stop(logger=logger)
-            if result in {"stopping_started", "force_requested", "already_stopping"}:
-                session.application_state = ApplicationState.STOPPING
-                needs_poll = True
-                if force and result == "stopping_started":
-                    session.controller.request_stop(logger=logger)
-            else:
-                session.application_state = ApplicationState.IDLE
+            try:
+                session.task_controller.stop_live_watch_time()
+            except Exception:
+                logger.exception("停止账号观看时长刷新失败")
+            try:
+                result = session.controller.request_stop(logger=logger)
+                if result in {"stopping_started", "force_requested", "already_stopping"}:
+                    session.application_state = ApplicationState.STOPPING
+                    needs_poll = True
+                    if force and result == "stopping_started":
+                        session.controller.request_stop(logger=logger)
+                else:
+                    session.application_state = ApplicationState.IDLE
+            except Exception:
+                logger.exception("停止账号后台失败，继续停止其他账号")
         if needs_poll:
             self._stop_poll_timer.start()
 
@@ -2393,12 +2432,17 @@ class MinerGUI(QMainWindow):
         self,
         session_id: str,
         settled_task_ids: tuple[str, ...],
+        expected_runtime_generation: int | None = None,
     ) -> None:
         session = self._account_sessions.get(session_id)
         if (
             session is None
             or not session.controller.is_running
             or session.controller.stop_signal_set
+            or (
+                expected_runtime_generation is not None
+                and session.runtime_generation != expected_runtime_generation
+            )
         ):
             return
         current_task_ids = tuple(parse_task_ids(session.task_ids_text))
@@ -2863,9 +2907,9 @@ class MinerGUI(QMainWindow):
     def auto_fetch_task_ids(self) -> None:
         if self._application_state == ApplicationState.DISCOVERING:
             self.browser_actions.cancel_discovery()
-            self._set_discovery_status("正在取消任务识别…", False)
-            self.discover_btn.setText("正在取消…")
-            self.discover_btn.setEnabled(False)
+            self._pending_start_after_discovery = False
+            self._active_session.pending_start_after_discovery = False
+            self._set_discovery_status("任务识别已取消", False)
             return
         self.browser_actions.auto_fetch_task_ids()
 
@@ -3045,15 +3089,21 @@ class MinerGUI(QMainWindow):
         self.close()
 
     def _shutdown_for_exit(self) -> None:
-        self._capture_active_session()
         self._login_validation_timer.stop()
         if hasattr(self, "_automatic_mining_timer"):
             self._automatic_mining_timer.stop()
         if hasattr(self, "browser_actions"):
             self.browser_actions.cancel_discovery()
+        for save in (
+            self._capture_active_session,
+            self._store_current_secrets,
+            self._write_cookie_profiles,
+        ):
+            try:
+                save()
+            except Exception:
+                logging.getLogger(__name__).exception("退出时保存失败，继续停止后台")
         try:
-            self._store_current_secrets()
-            self._write_cookie_profiles()
             self._stop_all_account_sessions(force=True)
         except Exception:
             logging.getLogger(__name__).exception("关闭时停止失败")

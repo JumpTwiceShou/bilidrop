@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -25,7 +26,7 @@ from bilibili_drops_miner.domain import (
     TaskSnapshot,
 )
 from bilibili_drops_miner.gui_parts import main_window as main_window_module
-from bilibili_drops_miner.gui_parts.account_sessions import LoginState
+from bilibili_drops_miner.gui_parts.account_sessions import AccountWorkspace, LoginState
 from bilibili_drops_miner.gui_parts.cookie_profiles import (
     CookieProfile,
     CookieProfileState,
@@ -90,7 +91,7 @@ def _dispose_window(item, app) -> None:
 
 
 def test_initial_gui_is_guided_and_secrets_are_masked(window, app) -> None:
-    assert window.windowTitle().endswith("v2.1.0")
+    assert window.windowTitle().endswith(main_window_module.APP_VERSION)
     assert window.runtime_state_label.text() == "未运行"
     assert window.cookie_edit.echoMode() == QLineEdit.Password
     assert window.notify_urls_edit.echoMode() == QLineEdit.Password
@@ -695,8 +696,9 @@ def test_discovery_button_becomes_cancel_action(window, monkeypatch) -> None:
     window.auto_fetch_task_ids()
 
     assert cancelled == [True]
-    assert window.discover_btn.text() == "正在取消…"
-    assert not window.discover_btn.isEnabled()
+    assert window.discover_btn.text() == "识别当前任务"
+    assert window.discover_btn.isEnabled()
+    assert window._application_state == ApplicationState.IDLE
 
 
 def test_temporary_cookie_has_uid_and_clear_lifetime_state(window, monkeypatch) -> None:
@@ -1628,6 +1630,158 @@ def test_expired_automatic_task_clears_stale_progress_and_stops_auto_runtime(
     assert session.task_ends_at is None
     assert not session.latest_task_snapshot.progresses
     assert "旧任务已结束" in session.discovery_status_text
+
+
+@pytest.mark.parametrize("target", ["new", "existing", "empty"])
+def test_pasting_cookie_preserves_original_account_workspace(window, monkeypatch, target):
+    first = window._active_session
+    first.cookie = "DedeUserID=10001; SESSDATA=first"
+    first.temporary = False
+    first.credential_id = "first"
+    first.rooms_text = "111"
+    first.task_ids_text = "first-task"
+    first.task_progress_result = "first-progress"
+    window._restore_active_session()
+    original = (first.cookie, first.uid, first.rooms_text, first.task_ids_text, first.task_progress_result)
+    second_cookie = "" if target == "empty" else "DedeUserID=10002; SESSDATA=second"
+    if target == "existing":
+        second = window._register_account_session(AccountWorkspace.temporary_account(cookie=second_cookie))
+    monkeypatch.setattr(window, "_confirm_save_new_cookie", lambda _: False)
+    window.cookie_edit.setText(second_cookie)
+    window._prompt_save_new_cookie()
+    assert (first.cookie, first.uid, first.rooms_text, first.task_ids_text, first.task_progress_result) == original
+    assert window._active_session is not first
+    assert window._active_session.cookie == second_cookie
+    if target == "existing":
+        assert window._active_session is second
+
+
+@pytest.mark.parametrize("failed_save", ["_store_current_secrets", "_write_cookie_profiles"])
+def test_shutdown_stops_workers_even_when_persistence_fails(window, monkeypatch, failed_save):
+    stopped = []
+    def fail():
+        raise OSError("test storage unavailable")
+    monkeypatch.setattr(window, failed_save, fail)
+    monkeypatch.setattr(window, "_stop_all_account_sessions", lambda **kw: stopped.append(kw))
+    window._shutdown_for_exit()
+    assert stopped == [{"force": True}]
+    assert not window._ui_alive
+
+
+def test_failed_profile_load_cannot_overwrite_existing_metadata(window, monkeypatch):
+    writes = []
+    def fail(**kw):
+        raise OSError("test unreadable profile")
+    monkeypatch.setattr(main_window_module, "load_cookie_profile_state", fail)
+    monkeypatch.setattr(main_window_module, "save_cookie_profiles", lambda *a, **kw: writes.append(a))
+    window._load_cookie_profiles()
+    with pytest.raises(OSError, match="加载失败"):
+        window._write_cookie_profiles()
+    assert writes == []
+
+
+@pytest.mark.parametrize("state", [ApplicationState.DISCOVERING, ApplicationState.RUNNING])
+def test_switching_accounts_invalidates_discovery(window, monkeypatch, state):
+    second = window._register_account_session(AccountWorkspace.temporary_account())
+    cancelled = []
+    monkeypatch.setattr(window.browser_actions, "cancel_discovery", lambda: cancelled.append(True))
+    window._set_application_state(state)
+    first = window._active_session
+    window._activate_account_session(second.session_id, remember_saved=False)
+    assert cancelled == [True]
+    assert first.application_state == (ApplicationState.IDLE if state == ApplicationState.DISCOVERING else state)
+
+
+def test_stopping_one_broken_worker_does_not_skip_other_accounts(window, monkeypatch):
+    second = window._register_account_session(AccountWorkspace.temporary_account())
+    stopped = []
+    def fail(**kw):
+        raise RuntimeError("test failed stop")
+    monkeypatch.setattr(window._active_session.controller, "request_stop", fail)
+    monkeypatch.setattr(second.controller, "request_stop", lambda **kw: stopped.append(True))
+    window._stop_all_account_sessions(force=True)
+    assert stopped == [True]
+
+
+def test_partial_progress_cannot_stop_automatic_mining(window, monkeypatch):
+    session = window._active_session
+    session.controller = _FakeWorkerController()
+    session.controller.is_running = True
+    session.auto_started_runtime = True
+    window._automatic_mining_session_ids.add(session.session_id)
+    group = DiscoveredTaskGroup("today", ("done", "missing"), True)
+    window._apply_automatic_account_check(AutomaticAccountCheckResult(
+        session_id=session.session_id,
+        selection=ScheduledTaskSelection(group, "current", 900),
+        snapshot=TaskSnapshot(progresses=(TaskProgress("done", "done", 3, 1, 1),)),
+        live_status=1,
+    ))
+    assert session.controller.stop_requests == 0
+    assert "全部完成" not in session.discovery_status_text
+
+
+@pytest.mark.parametrize("replacement", ["task", "run"])
+def test_old_reward_callback_cannot_stop_replacement_work(window, monkeypatch, replacement):
+    session = window._active_session
+    session.controller = _FakeWorkerController()
+    session.cookie = "DedeUserID=10001; SESSDATA=one"
+    session.login_state = LoginState.VALID
+    session.rooms_text = "23612045"
+    session.task_ids_text = "old"
+    window._automatic_mining_session_ids.add(session.session_id)
+    queued = []
+    monkeypatch.setattr(window, "_post_ui_task", lambda callback, *args: queued.append((callback, args)))
+    assert window._start_account_session(session, interactive=False)
+    old_callback = session.controller.on_rewards_settled
+    old_callback(("old",))
+    if replacement == "task":
+        session.task_ids_text = "new"
+    else:
+        session.controller.is_running = False
+        assert window._start_account_session(session, interactive=False)
+    for callback, args in queued:
+        callback(*args)
+    assert session.controller.stop_requests == 0
+
+
+def test_background_claim_results_follow_ids_instead_of_response_order(window, monkeypatch):
+    session = window._active_session
+    group = DiscoveredTaskGroup("current", ("parent",), True)
+    first = TaskCheckpointProgress("first", "first", 2, 1, 1)
+    second = TaskCheckpointProgress("second", "second", 2, 1, 1)
+    progress = TaskProgress("parent", "parent", 2, 1, 1, [first, second])
+    captured = []
+
+    class FakeClient:
+        async def get_task_progress(self, task_ids):
+            assert task_ids == ["parent"]
+            return [progress]
+
+        async def get_live_room_info(self, room_id):
+            return SimpleNamespace(live_status=1)
+
+        async def receive_all_mission_rewards(self, task_ids):
+            assert task_ids == ["first", "second"]
+            return [
+                SimpleNamespace(task_id="second", success=True),
+                SimpleNamespace(task_id="first", success=False),
+            ]
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(main_window_module, "BilibiliClient", lambda _: FakeClient())
+    monkeypatch.setattr(window, "_automatic_discovery_service", SimpleNamespace(
+        discover=lambda *args, **kwargs: SimpleNamespace(groups=(group,), message=""),
+    ))
+    monkeypatch.setattr(window, "_post_ui_task", lambda callback, result: captured.append(result))
+    window._run_automatic_account_check(
+        session.session_id, session.configuration_generation, "synthetic", 123, False,
+    )
+    assert len(captured) == 1
+    assert not captured[0].error
+    assert first.status == 2
+    assert second.status == 3
 
 
 def test_stale_automatic_result_cannot_overwrite_new_configuration(

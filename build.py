@@ -67,7 +67,23 @@ def build(
 
     print(f"\nBuilding {name} ...")
     print(format_cmd(cmd))
-    subprocess.check_call(cmd)
+    build_env = os.environ.copy()
+    if sys.platform == "win32":
+        # PyInstaller searches PATH for native dependencies. Other applications
+        # may ship incompatible DLLs under system names (for example icuuc.dll),
+        # which can make a successful build fail while importing QtCore.
+        # Package hooks locate Python dependencies; only Python and Windows
+        # runtime directories should participate in the fallback DLL search.
+        windows_dir = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        build_env["PATH"] = os.pathsep.join(
+            str(path)
+            for path in (
+                Path(sys.executable).parent,
+                windows_dir / "System32",
+                windows_dir,
+            )
+        )
+    subprocess.check_call(cmd, env=build_env)
 
     if onefile:
         print(f"Done: dist/{name}.exe")

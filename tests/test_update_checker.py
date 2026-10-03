@@ -1,12 +1,13 @@
-from bilibili_drops_miner._version import APP_VERSION
+from bilibili_drops_miner._version import APP_VERSION, UPDATE_CHANNEL
 from bilibili_drops_miner.gui_parts.update_checker import (
     parse_update_payload,
     should_check_update,
 )
 
 
-def test_application_version_is_v2_1_0() -> None:
-    assert APP_VERSION == "v2.1.0"
+def test_application_version_is_v2_1_1() -> None:
+    assert APP_VERSION == "v2.1.1"
+    assert should_check_update(APP_VERSION, UPDATE_CHANNEL)
 
 
 def test_release_channel_checks_for_updates() -> None:

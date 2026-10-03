@@ -70,6 +70,7 @@ class AccountWorkspace:
     automation_state: AutomationState = AutomationState.OFF
     task_phase: TaskPhase = TaskPhase.UNKNOWN
     configuration_generation: int = 0
+    runtime_generation: int = 0
     request_coordinator: AccountRequestCoordinator = field(
         default_factory=AccountRequestCoordinator
     )

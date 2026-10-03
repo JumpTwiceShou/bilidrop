@@ -1,14 +1,17 @@
 import json
 import threading
+from datetime import datetime, timedelta, timezone
 
-from bilibili_drops_miner.domain import DiscoveryStatus
+from bilibili_drops_miner.domain import DiscoveredTaskGroup, DiscoveryStatus
 from bilibili_drops_miner.task_discovery import TaskDiscoveryService
 
 
 def _html(groups, panels, active="") -> str:
     state = {
         "EraTasklistPc": groups,
-        "EvaPositionBox": [{"left": 0, "top": index * 20} for index in range(len(groups))],
+        "EvaPositionBox": [
+            {"left": 0, "top": index * 20} for index in range(len(groups))
+        ],
         "EvaTabs.Panel": panels,
         "EvaTabs": [{"activatedTabPanelId": active}],
     }
@@ -47,8 +50,14 @@ def test_headless_discovery_navigates_to_room_and_selects_active_group() -> None
                 {"tasklist": [{"taskId": "b"}]},
             ],
             [
-                {"id": "old", "tabItem": {"tabItemProps": {"textContent": {"content": "昨日"}}}},
-                {"id": "now", "tabItem": {"tabItemProps": {"textContent": {"content": "今日"}}}},
+                {
+                    "id": "old",
+                    "tabItem": {"tabItemProps": {"textContent": {"content": "昨日"}}},
+                },
+                {
+                    "id": "now",
+                    "tabItem": {"tabItemProps": {"textContent": {"content": "今日"}}},
+                },
             ],
             active="now",
         )
@@ -216,3 +225,49 @@ def test_offline_room_checks_task_page_before_skipping_browser_wait() -> None:
     assert page_checked == [23612045]
     assert "未开播" in result.message
     assert "仍可直接开始挂机" in result.message
+
+
+def test_schedule_overrides_expired_active_tab():
+    now = datetime.now(timezone.utc)
+    old = DiscoveredTaskGroup(
+        "old", ("old",), True, now - timedelta(days=2), now - timedelta(days=1)
+    )
+    current = DiscoveredTaskGroup(
+        "current",
+        ("current",),
+        False,
+        now - timedelta(hours=1),
+        now + timedelta(hours=1),
+    )
+    result = TaskDiscoveryService._result_from_groups(111, (old, current))
+    assert result.selected_group == current
+    expired = TaskDiscoveryService._result_from_groups(111, (old,))
+    assert expired.status == DiscoveryStatus.NO_TASKS
+    assert expired.selected_group is None
+    assert "结束" in expired.message
+
+
+def test_cached_groups_are_reselected_when_task_period_changes(monkeypatch):
+    from bilibili_drops_miner import task_discovery as module
+
+    now = datetime.now(timezone.utc)
+    first = DiscoveredTaskGroup(
+        "first", ("first",), True, now - timedelta(hours=1), now + timedelta(seconds=1)
+    )
+    second = DiscoveredTaskGroup(
+        "second",
+        ("second",),
+        False,
+        now + timedelta(seconds=1),
+        now + timedelta(hours=1),
+    )
+    service = TaskDiscoveryService(fast_path=lambda _: (first, second))
+    assert service.discover(111).selected_group == first
+
+    class Later(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return (now + timedelta(seconds=2)).astimezone(tz)
+
+    monkeypatch.setattr(module, "datetime", Later)
+    assert service.discover(111).selected_group == second

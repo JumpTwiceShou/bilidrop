@@ -19,6 +19,7 @@ from bilibili_drops_miner.gui_parts.browser_utils import (
 from bilibili_drops_miner.utils import extract_bili_live_task_groups
 from bilibili_drops_miner.domain import DiscoveryStatus, TaskDiscoveryResult
 from bilibili_drops_miner.task_discovery import TaskDiscoveryService
+from bilibili_drops_miner.task_page_fetcher import extract_room_aliases
 
 
 class BrowserActions:
@@ -46,12 +47,15 @@ class BrowserActions:
         self._set_task_ids = set_task_ids
         self._get_room_ids = get_room_ids or (lambda: [])
         self._get_cookie = get_cookie or (lambda: "")
-        self._set_discovery_status = set_discovery_status or (lambda _text, _error=False: None)
+        self._set_discovery_status = set_discovery_status or (
+            lambda _text, _error=False: None
+        )
         self._logger = logger or logging.getLogger(__name__)
         self._discovery_service = TaskDiscoveryService()
         self._discovery_cancel = threading.Event()
         self._discovery_lock = threading.Lock()
         self._discovery_inflight = False
+        self._sniff_thread: threading.Thread | None = None
         self._preferred_browser = detect_default_browser()
 
     @staticmethod
@@ -130,12 +134,38 @@ class BrowserActions:
         room_id: int | None,
         task_groups: list[dict[str, object]],
     ) -> None:
+        cancel_event = self._discovery_cancel
         if room_id is not None and room_id > 0:
             self._set_room_id(room_id)
 
         if not task_groups:
             self._show_warning("提示", "未从当前直播页解析到掉宝任务分组")
             return
+
+        result = TaskDiscoveryService._result_from_groups(
+            room_id or 0, TaskDiscoveryService.groups_from_data(task_groups)
+        )
+        if result.status == DiscoveryStatus.NO_TASKS:
+            self._set_task_ids("")
+            self._set_discovery_status(result.message, False)
+            return
+        if result.selected_group is not None:
+            task_ids = list(result.selected_group.task_ids)
+            self._set_task_ids(",".join(task_ids))
+            self._set_discovery_status(
+                f"已识别当前任务组（{len(task_ids)} 个任务系列），正在加载全部奖励节点…",
+                False,
+            )
+            self._logger.info("任务ID获取成功: %s", ",".join(task_ids))
+            return
+
+        # Dated groups have already been evaluated. Only undated, ambiguous
+        # groups need a human choice; never offer an expired group as current.
+        task_groups = [
+            group
+            for group in task_groups
+            if not group.get("start_at") or not group.get("end_at")
+        ]
 
         options = [
             f"{str(group.get('label') or '任务组')} ({len(group.get('task_ids') or [])} 个任务)"
@@ -147,32 +177,6 @@ class BrowserActions:
                 default_index = index
                 break
 
-        active_groups = [group for group in task_groups if bool(group.get("active"))]
-        if len(task_groups) == 1:
-            selected_group = task_groups[0]
-        elif len(active_groups) == 1:
-            selected_group = active_groups[0]
-        else:
-            selected_group = None
-
-        if selected_group is not None:
-            task_ids = [
-                str(task_id).strip()
-                for task_id in (selected_group.get("task_ids") or [])
-                if str(task_id).strip()
-            ]
-            if task_ids:
-                self._set_task_ids(",".join(task_ids))
-                self._set_discovery_status(
-                    (
-                        f"已识别当天任务组（{len(task_ids)} 个任务系列），"
-                        "正在加载全部奖励节点…"
-                    ),
-                    False,
-                )
-                self._logger.info("任务ID获取成功: %s", ",".join(task_ids))
-                return
-
         selected_option, ok = QInputDialog.getItem(
             self._parent,
             "选择掉宝任务组",
@@ -181,8 +185,11 @@ class BrowserActions:
             default_index,
             False,
         )
+        if not self._discovery_is_current(cancel_event):
+            return
         if not ok:
             self._logger.info("用户取消了掉宝任务组选择")
+            self._set_discovery_status("任务识别已取消", False)
             return
 
         try:
@@ -202,10 +209,7 @@ class BrowserActions:
 
         self._set_task_ids(",".join(task_ids))
         self._set_discovery_status(
-            (
-                f"已识别当天任务组（{len(task_ids)} 个任务系列），"
-                "正在加载全部奖励节点…"
-            ),
+            (f"已选择任务组（{len(task_ids)} 个任务系列），正在加载全部奖励节点…"),
             False,
         )
         self._logger.info(
@@ -225,13 +229,22 @@ class BrowserActions:
         browser_preference: str | None = None,
         finish_on_any: bool = False,
         on_failure: Callable[[str], None] | None = None,
+        cancel_event: threading.Event | None = None,
+        initial_url: str = "https://www.bilibili.com/",
     ) -> None:
         def on_error(title: str, message: str) -> None:
-            if on_failure is not None:
-                self._post_ui_task(on_failure, message)
-            self._post_ui_task(self._show_error, title, message)
+            def apply_error() -> None:
+                if cancel_event is not None and not self._discovery_is_current(
+                    cancel_event
+                ):
+                    return
+                if on_failure is not None:
+                    on_failure(message)
+                self._show_error(title, message)
 
-        start_browser_sniff(
+            self._post_ui_task(apply_error)
+
+        self._sniff_thread = start_browser_sniff(
             url_keyword,
             hint,
             on_error=on_error,
@@ -242,6 +255,8 @@ class BrowserActions:
             browser_preference=browser_preference,
             finish_on_any=finish_on_any,
             logger=self._logger,
+            cancel_event=cancel_event,
+            initial_url=initial_url,
         )
 
     def auto_fetch_room_id(self) -> None:
@@ -286,7 +301,8 @@ class BrowserActions:
                 self._show_warning("提示", "任务识别正在进行中")
                 return
             self._discovery_inflight = True
-        self._discovery_cancel.clear()
+            self._discovery_cancel = threading.Event()
+            cancel_event = self._discovery_cancel
         room_id = room_ids[0]
         cookie = self._get_cookie().strip()
         preferred_browser = self._preferred_browser
@@ -300,12 +316,15 @@ class BrowserActions:
                     headless=True,
                     cookie=cookie,
                     browser_preference=preferred_browser,
-                    cancel_event=self._discovery_cancel,
+                    cancel_event=cancel_event,
                 )
-                self._post_ui_task(self._handle_background_discovery, result)
-            finally:
-                with self._discovery_lock:
-                    self._discovery_inflight = False
+            except Exception as exc:
+                result = TaskDiscoveryResult(
+                    room_id, DiscoveryStatus.ERROR, message=str(exc)
+                )
+            self._post_discovery_task(
+                cancel_event, self._handle_background_discovery, result
+            )
 
         threading.Thread(
             target=_do,
@@ -314,7 +333,10 @@ class BrowserActions:
         ).start()
 
     def _handle_background_discovery(self, result: TaskDiscoveryResult) -> None:
-        if result.succeeded:
+        if self._discovery_cancel.is_set():
+            return
+        if result.groups:
+            self._finish_discovery()
             groups = [
                 {
                     "label": group.label,
@@ -326,9 +348,7 @@ class BrowserActions:
                         else None
                     ),
                     "end_at": (
-                        group.end_at.isoformat()
-                        if group.end_at is not None
-                        else None
+                        group.end_at.isoformat() if group.end_at is not None else None
                     ),
                 }
                 for group in result.groups
@@ -336,10 +356,11 @@ class BrowserActions:
             self.apply_selected_task_group(result.room_id, groups)
             return
         if result.status == DiscoveryStatus.CANCELLED:
+            self._finish_discovery()
             self._set_discovery_status(result.message, False)
             return
         self._set_discovery_status(
-            "后台识别未完成，正在启动可见浏览器兜底…",
+            "正在启动可见浏览器兜底，继续识别任务…",
             False,
         )
         self._logger.info(
@@ -357,6 +378,9 @@ class BrowserActions:
         *,
         confirm: bool = True,
     ) -> None:
+        cancel_event = self._discovery_cancel
+        if not self._discovery_is_current(cancel_event):
+            return
         if confirm:
             ok = QMessageBox.question(
                 self._parent,
@@ -373,27 +397,52 @@ class BrowserActions:
 
         browser = self.pick_browser()
         if browser is None:
+            self._finish_discovery()
+            self._set_discovery_status("任务识别已取消", False)
             return
 
+        room_aliases = {room_id} if room_id else set()
+
         def on_page_html(page_html: str, page_url: str) -> bool:
-            room_id = extract_room_id_from_live_url(page_url)
+            if not self._discovery_is_current(cancel_event):
+                return False
+            captured_room_id = extract_room_id_from_live_url(page_url)
+            if room_id is not None:
+                room_aliases.update(extract_room_aliases(page_html, room_id))
+            if captured_room_id is None or (
+                room_id is not None and captured_room_id not in room_aliases
+            ):
+                return False
             task_groups = extract_bili_live_task_groups(page_html)
             if not task_groups:
                 return False
-            self._post_ui_task(self.apply_selected_task_group, room_id, task_groups)
+            self._post_discovery_task(
+                cancel_event, apply_groups, captured_room_id, task_groups
+            )
             return True
 
+        def apply_groups(captured_room_id, task_groups) -> None:
+            self._finish_discovery()
+            self.apply_selected_task_group(captured_room_id, task_groups)
+
+        def apply_network(captured_room_id, task_ids) -> None:
+            self._finish_discovery()
+            self._set_room_id(captured_room_id)
+            self._set_task_ids(",".join(task_ids))
+            self._set_discovery_status(
+                f"已从任务接口识别 {len(task_ids)} 个任务", False
+            )
+
         def on_match(payload: Any) -> None:
+            if not self._discovery_is_current(cancel_event):
+                raise ValueError("任务识别已取消")
             payload_data = payload if isinstance(payload, dict) else {}
-            request_url = str(payload_data.get("url") or "")
             page_url = str(payload_data.get("page_url") or "")
             captured_room_id = extract_room_id_from_live_url(page_url)
             if captured_room_id is None:
                 raise ValueError("尚未进入 Bilibili 直播间")
-            if room_id is not None and captured_room_id != room_id:
+            if room_id is not None and captured_room_id not in room_aliases:
                 raise ValueError("尚未进入待识别的目标直播间")
-            self._post_ui_task(self._set_room_id, captured_room_id)
-            self._logger.info("房间号获取成功: %s", captured_room_id)
 
             data = payload_data.get("data")
             if not isinstance(data, dict):
@@ -401,14 +450,24 @@ class BrowserActions:
             if data.get("code") != 0:
                 raise ValueError("response code != 0")
             tasks = data.get("data", {}).get("list", [])
-            task_ids = [task.get("task_id") for task in tasks if task.get("task_id")]
+            task_ids = [
+                str(task.get("task_id"))
+                for task in tasks
+                if isinstance(task, dict) and task.get("task_id")
+            ]
             if not task_ids:
                 raise ValueError("empty task list")
-            self._post_ui_task(self._set_task_ids, ",".join(task_ids))
+            self._post_discovery_task(
+                cancel_event, apply_network, captured_room_id, task_ids
+            )
             self._logger.info(
                 "任务ID获取成功（API 兜底）: %s",
                 ",".join(task_ids),
             )
+
+        def failed(message: str) -> None:
+            self._finish_discovery()
+            self._set_discovery_status(f"浏览器兜底识别失败：{message}", True)
 
         self.browser_sniff(
             "/x/task/totalv2",
@@ -417,14 +476,30 @@ class BrowserActions:
             on_page_html=on_page_html,
             browser_preference=browser,
             finish_on_any=True,
-            on_failure=lambda message: self._set_discovery_status(
-                f"浏览器兜底识别失败：{message}",
-                True,
-            ),
+            on_failure=failed,
+            cancel_event=cancel_event,
+            initial_url=f"https://live.bilibili.com/{room_id}"
+            if room_id
+            else "https://live.bilibili.com/",
         )
 
     def cancel_discovery(self) -> None:
         self._discovery_cancel.set()
+        self._finish_discovery()
+
+    def _finish_discovery(self) -> None:
+        with self._discovery_lock:
+            self._discovery_inflight = False
+
+    def _discovery_is_current(self, cancel_event: threading.Event) -> bool:
+        return cancel_event is self._discovery_cancel and not cancel_event.is_set()
+
+    def _post_discovery_task(self, cancel_event, callback, *args) -> None:
+        def apply_if_current() -> None:
+            if self._discovery_is_current(cancel_event):
+                callback(*args)
+
+        self._post_ui_task(apply_if_current)
 
     def rediscover_task_ids(self) -> None:
         try:

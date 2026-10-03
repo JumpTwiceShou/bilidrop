@@ -1,6 +1,8 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from bilibili_drops_miner.automatic_mining import (
     all_task_rewards_claimed,
     all_tasks_completed,
@@ -121,3 +123,19 @@ def test_all_reward_nodes_must_be_complete_before_stopping_heartbeats() -> None:
     for point in task.check_points:
         point.status = 3
     assert all_task_rewards_claimed(TaskSnapshot(progresses=(task,)))
+
+
+@pytest.mark.parametrize("claimed_status", [3, 6])
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_claimed_reward_status_remains_authoritative_when_numeric_progress_lags(
+    claimed_status, checkpoint
+) -> None:
+    task = TaskProgress("daily", "task", claimed_status, 1, 60)
+    if checkpoint:
+        task.check_points = [
+            TaskCheckpointProgress("node", "reward", claimed_status, 1, 60)
+        ]
+    snapshot = TaskSnapshot(progresses=(task,))
+    assert not all_tasks_completed(snapshot)
+    assert all_task_rewards_claimed(snapshot)
+    assert all_task_rewards_claimed(snapshot, expected_task_ids=("daily",))

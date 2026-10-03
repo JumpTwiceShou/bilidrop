@@ -7,15 +7,22 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import httpx
+
+from bilibili_drops_miner.automatic_mining import select_scheduled_task_group
 
 from bilibili_drops_miner.domain import (
     DiscoveredTaskGroup,
     DiscoveryStatus,
     TaskDiscoveryResult,
 )
-from bilibili_drops_miner.gui_parts.browser_utils import browser_label, browser_try_order
+from bilibili_drops_miner.gui_parts.browser_utils import (
+    browser_label,
+    browser_try_order,
+)
+from bilibili_drops_miner.task_page_fetcher import fetch_task_page
 from bilibili_drops_miner.utils import extract_bili_live_task_groups, parse_cookie
 
 LOGGER = logging.getLogger(__name__)
@@ -105,7 +112,9 @@ class TaskDiscoveryService:
                 LOGGER.info("无需启动浏览器，已从房间任务数据中完成识别")
                 return self._remember(result)
         except Exception as exc:
-            LOGGER.info("直接任务数据识别未命中（%s），继续后台兜底", type(exc).__name__)
+            LOGGER.info(
+                "直接任务数据识别未命中（%s），继续后台兜底", type(exc).__name__
+            )
 
         try:
             live_status = self.room_status_fetcher(
@@ -239,30 +248,43 @@ class TaskDiscoveryService:
 
     @staticmethod
     def _parse_groups(page_html: str) -> tuple[DiscoveredTaskGroup, ...]:
+        return TaskDiscoveryService.groups_from_data(
+            extract_bili_live_task_groups(page_html)
+        )
+
+    @staticmethod
+    def groups_from_data(
+        groups: Iterable[dict[str, object]],
+    ) -> tuple[DiscoveredTaskGroup, ...]:
         return tuple(
             DiscoveredTaskGroup(
                 label=str(group.get("label") or "任务组"),
                 task_ids=tuple(str(item) for item in group.get("task_ids") or ()),
                 active=bool(group.get("active")),
-                start_at=TaskDiscoveryService._parse_datetime(
-                    group.get("start_at")
-                ),
-                end_at=TaskDiscoveryService._parse_datetime(
-                    group.get("end_at")
-                ),
+                start_at=TaskDiscoveryService._parse_datetime(group.get("start_at")),
+                end_at=TaskDiscoveryService._parse_datetime(group.get("end_at")),
             )
-            for group in extract_bili_live_task_groups(page_html)
+            for group in groups
         )
 
     @staticmethod
     def _parse_datetime(value: object) -> datetime | None:
         if isinstance(value, datetime):
-            return value
+            return (
+                value
+                if value.tzinfo
+                else value.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+            )
         text = str(value or "").strip()
         if not text:
             return None
         try:
-            return datetime.fromisoformat(text)
+            parsed = datetime.fromisoformat(text)
+            return (
+                parsed
+                if parsed.tzinfo
+                else parsed.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+            )
         except ValueError:
             return None
 
@@ -282,25 +304,28 @@ class TaskDiscoveryService:
         browser: str = "",
     ) -> TaskDiscoveryResult:
         group_tuple = tuple(groups)
-        active = [group for group in group_tuple if group.active]
-        if len(active) == 1:
-            selected = active[0]
-        elif len(group_tuple) == 1:
-            selected = group_tuple[0]
-        else:
-            selected = None
+        selection = select_scheduled_task_group(
+            group_tuple, now=datetime.now(ZoneInfo("Asia/Shanghai"))
+        )
+        selected = selection.group if selection.phase == "current" else None
         status = DiscoveryStatus.SUCCESS if selected else DiscoveryStatus.AMBIGUOUS
+        message = (
+            f"已识别 {len(selected.task_ids)} 个任务"
+            if selected is not None
+            else f"检测到 {len(group_tuple)} 个任务组，需要选择"
+        )
+        if selection.phase in {"expired", "future"}:
+            status = DiscoveryStatus.NO_TASKS
+            message = (
+                "活动任务已结束" if selection.phase == "expired" else "活动任务尚未开始"
+            )
         return TaskDiscoveryResult(
             room_id=room_id,
             status=status,
             groups=group_tuple,
             selected_group=selected,
             browser=browser,
-            message=(
-                f"已识别 {len(selected.task_ids)} 个任务"
-                if selected is not None
-                else f"检测到 {len(group_tuple)} 个任务组，需要选择"
-            ),
+            message=message,
         )
 
     def _get_cached(self, room_id: int) -> TaskDiscoveryResult | None:
@@ -312,7 +337,9 @@ class TaskDiscoveryService:
             if time.monotonic() - stored_at > self.cache_ttl_seconds:
                 self._cache.pop(room_id, None)
                 return None
-            return result
+            return self._result_from_groups(
+                room_id, result.groups, browser=result.browser
+            )
 
     def _remember(self, result: TaskDiscoveryResult) -> TaskDiscoveryResult:
         with self._cache_lock:
@@ -361,24 +388,7 @@ class TaskDiscoveryService:
 
     @staticmethod
     def _fetch_room_html(room_id: int, cookie: str, timeout_seconds: float) -> str:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            "Referer": f"https://live.bilibili.com/{room_id}",
-        }
-        if cookie:
-            headers["Cookie"] = cookie
-        response = httpx.get(
-            f"https://live.bilibili.com/{room_id}",
-            headers=headers,
-            follow_redirects=True,
-            timeout=timeout_seconds,
-        )
-        response.raise_for_status()
-        return response.content.decode("utf-8", errors="replace")
+        return fetch_task_page(room_id, cookie, timeout_seconds)
 
     @staticmethod
     def _fetch_room_live_status(room_id: int, timeout_seconds: float) -> int | None:

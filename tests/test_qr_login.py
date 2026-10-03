@@ -6,10 +6,12 @@ import httpx
 import pytest
 from PySide6.QtWidgets import QApplication
 
-from bilibili_drops_miner.gui_parts.qr_login_dialog import render_qr_pixmap
+from bilibili_drops_miner.gui_parts.qr_login_dialog import QrLoginDialog, render_qr_pixmap
 from bilibili_drops_miner.qr_login import (
     BilibiliQrLoginService,
     QrLoginState,
+    QrLoginPollResult,
+    QrLoginSession,
 )
 
 
@@ -92,3 +94,19 @@ def test_qr_pixmap_is_rendered_without_pillow(app) -> None:
     assert not pixmap.isNull()
     assert 150 <= pixmap.width() <= 240
     assert pixmap.width() == pixmap.height()
+
+
+def test_cancelled_qr_dialog_discards_queued_results(app, monkeypatch):
+    monkeypatch.setattr(QrLoginDialog, "_create_session", lambda self: None)
+    success = []
+    dialog = QrLoginDialog(None, on_success=success.append)
+    dialog._timer.start()
+    dialog.reject()
+    previous = dialog.status_label.text()
+    dialog._on_poll_ready(QrLoginPollResult(QrLoginState.SUCCESS, "logged in", "synthetic-cookie"))
+    dialog._on_request_failed("late failure")
+    dialog._on_session_ready(QrLoginSession("https://example.invalid/qr", "fixture-key"))
+    assert success == []
+    assert dialog.status_label.text() == previous
+    assert not dialog._timer.isActive()
+    dialog.deleteLater()

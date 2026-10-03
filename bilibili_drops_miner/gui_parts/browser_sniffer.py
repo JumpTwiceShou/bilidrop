@@ -5,7 +5,6 @@ import logging
 import shutil
 import tempfile
 import threading
-import time
 from collections.abc import Callable, Iterable
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Literal
@@ -78,8 +77,11 @@ def start_browser_sniff(
     browser_preference: str | None = None,
     finish_on_any: bool = False,
     logger: logging.Logger | None = None,
+    cancel_event: threading.Event | None = None,
+    initial_url: str = "https://www.bilibili.com/",
 ) -> threading.Thread:
     logger = logger or logging.getLogger(__name__)
+    cancel_event = cancel_event or threading.Event()
 
     def _do() -> None:
         server = None
@@ -89,6 +91,8 @@ def start_browser_sniff(
         browser_type = None
         cdp_session = None
         try:
+            if cancel_event.is_set():
+                return
             from selenium import webdriver
 
             need_net = bool(url_keyword and on_network_match)
@@ -143,6 +147,8 @@ def start_browser_sniff(
 
             last_exc = None
             for browser in browser_try_order(browser_preference):
+                if cancel_event.is_set():
+                    return
                 if not find_browser(browser):
                     logger.info("未检测到 %s，跳过", browser)
                     continue
@@ -187,13 +193,16 @@ def start_browser_sniff(
                     browser_type = None
                     logger.warning("浏览器 %s 启动失败: %s", browser, exc)
 
+            if cancel_event.is_set():
+                return
             if driver is None:
                 raise RuntimeError(
                     "未找到可用浏览器（Edge/Chrome），请确认已安装并配置好 WebDriver。"
                     f"\n最后错误: {last_exc}"
                 )
 
-            driver.get("https://www.bilibili.com/")
+            driver.set_page_load_timeout(20)
+            driver.get(initial_url)
             logger.info("%s（浏览器: %s）", hint, browser_label(browser_type or ""))
 
             cookie_done = False
@@ -203,6 +212,8 @@ def start_browser_sniff(
             html_attempts = 0
             last_cookie_count = 0
             for _ in range(120):
+                if cancel_event.is_set():
+                    return
                 if need_cookie and not cookie_done and cookie_captured:
                     current_cookies = cookie_captured[-1]
                     filtered_cookies = select_login_cookies(current_cookies)
@@ -258,6 +269,7 @@ def start_browser_sniff(
                 if (
                     need_net
                     and not net_done
+                    and not (finish_on_any and html_done)
                     and net_captured
                     and network_ready
                     and on_network_match is not None
@@ -283,17 +295,20 @@ def start_browser_sniff(
                 ):
                     break
 
-                time.sleep(1)
+                if cancel_event.wait(1):
+                    return
             else:
                 raise TimeoutError(
                     "2 分钟内未捕获到有效结果，浏览器已自动关闭，请重新识别"
                 )
 
         except ImportError as exc:
-            on_error("依赖缺失", f"缺少依赖库，请安装后重试: {exc}\n\n")
+            if not cancel_event.is_set():
+                on_error("依赖缺失", f"缺少依赖库，请安装后重试: {exc}\n\n")
         except Exception as exc:
-            logger.exception("自动获取失败")
-            on_error("错误", f"自动获取失败: {exc}")
+            if not cancel_event.is_set():
+                logger.exception("自动获取失败")
+                on_error("错误", f"自动获取失败: {exc}")
         finally:
             if server:
                 try:

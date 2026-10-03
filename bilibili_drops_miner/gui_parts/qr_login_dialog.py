@@ -114,7 +114,7 @@ class QrLoginDialog(QDialog):
         self.session_ready.connect(self._on_session_ready)
         self.request_failed.connect(self._on_request_failed)
         self.poll_ready.connect(self._on_poll_ready)
-        self.finished.connect(lambda _result: self._closed.set())
+        self.finished.connect(self._on_finished)
 
         threading.Thread(
             target=self._create_session,
@@ -133,6 +133,8 @@ class QrLoginDialog(QDialog):
             self.session_ready.emit(session)
 
     def _on_session_ready(self, session: QrLoginSession) -> None:
+        if self._closed.is_set():
+            return
         self._session = session
         pixmap = render_qr_pixmap(session.url)
         self.qr_label.setPixmap(pixmap)
@@ -167,6 +169,8 @@ class QrLoginDialog(QDialog):
             self.poll_ready.emit(result)
 
     def _on_poll_ready(self, result: QrLoginPollResult) -> None:
+        if self._closed.is_set():
+            return
         self._poll_inflight = False
         self.status_label.setText(result.message)
         if result.state == QrLoginState.EXPIRED:
@@ -177,8 +181,14 @@ class QrLoginDialog(QDialog):
             self._on_success(result.cookie)
 
     def _on_request_failed(self, message: str) -> None:
+        if self._closed.is_set():
+            return
         self.status_label.setText(message)
         self.qr_label.setText("二维码获取失败")
+
+    def _on_finished(self, _result: int) -> None:
+        self._closed.set()
+        self._timer.stop()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._closed.set()
